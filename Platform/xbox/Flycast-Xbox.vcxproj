@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <ProjectGuid>{f1ca57a0-0000-4000-8000-00000000F1CA}</ProjectGuid>
+    <RootNamespace>FlycastXbox</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>Flycast-Xbox</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <!-- Compile-only bring-up phase: StaticLibrary so we can shake out per-file
+       compile errors across the ~100-file core with no link/entry noise. Flip
+       to Application + XDK shell once the core compiles. -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>NotSet</CharacterSet>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Label="UserMacros">
+    <FLY>$(ProjectDir)..\..\flycast</FLY>
+  </PropertyGroup>
+  <!-- Include order is load-bearing: modern VS2022 STL + UCRT FIRST, then our
+       shim dir (version.h / dirent.h / unistd.h / ws2tcpip.h), then the Flycast
+       core + deps, then RXDK headers LAST (its case-insensitive 2003 STL headers
+       Memory/Vector/... must NOT win the search). -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <VCInc>$(VCToolsInstallDir)include</VCInc>
+    <UCRTInc>$(UniversalCRT_IncludePath)</UCRTInc>
+    <FlyInc>$(ProjectDir)flycast_shim;$(FLY)\core;$(FLY)\core\deps;$(FLY)\core\deps\stb;$(FLY)\core\deps\glm;$(FLY)\core\deps\xxHash;$(FLY)\core\deps\chdpsr;$(FLY)\core\deps\nowide\include;$(FLY)\core\deps\libchdr\include;$(FLY)\core\deps\libchdr\deps\zlib-1.3.1;$(FLY)\core\deps\libchdr\deps\zstd-1.5.6\lib;$(FLY)\core\deps\libchdr\deps\lzma-24.05\include;$(FLY)\core\deps\libelf\include;$(FLY)\core\deps\lzma;$(FLY)\core\deps\xbyak</FlyInc>
+    <IncludePath>$(VCInc);$(UCRTInc);$(FlyInc);$(RXDK_LIBS)include</IncludePath>
+    <ExternalIncludePath>$(VCInc);$(UCRTInc);$(RXDK_LIBS)include</ExternalIncludePath>
+    <LibraryPath>$(RXDK_LIBS)lib</LibraryPath>
+    <ReferencePath>$(RXDK_LIBS)lib</ReferencePath>
+    <ExcludePath>$(RXDK_LIBS)lib</ExcludePath>
+    <OutDir>$(ProjectDir)build\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\</IntDir>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <SDLCheck>false</SDLCheck>
+      <!-- NO_REND => null renderer (we replace it at runtime with our D3D8 renderer).
+           _NTOS_ => suppress RXDK winbase Interlocked clash with VS2022 intrinsics.
+           TARGET_NO_REC => interpreter SH-4 (build.h forces all DYNAREC_NONE).
+           The x86 JIT can't reach NXDK-port speeds on RXDK: fastmem needs the
+           runtime to deliver JIT-code faults and RXDK doesn't, while the no-fastmem
+           JIT is slower (memory ops become calls vs the interpreter's inline access)
+           with a slow compile-heavy boot. So we stay on the interpreter and improve
+           it / the renderer instead. Compatibility headers live in flycast_shim/
+           (don't delete). Re-enable JIT: remove TARGET_NO_REC, add FEAT_DSPREC. -->
+      <PreprocessorDefinitions>XBOX;_XBOX;NDEBUG;_NTOS_;_WIN32_WINNT=0x0600;NO_REND;FEAT_NO_MINIUPNPC;TARGET_NO_REC;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;NOMINMAX;_USE_MATH_DEFINES;_7ZIP_ST;ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>false</ConformanceMode>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <!-- /FS: serialize PDB writes (the C deps compile with MultiProcessorCompilation). -->
+      <AdditionalOptions>/FS /arch:SSE /Zc:sizedDealloc- /Zc:threadSafeInit- /Gy %(AdditionalOptions)</AdditionalOptions>
+      <ControlFlowGuard>false</ControlFlowGuard>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <EnableEnhancedInstructionSet>StreamingSIMDExtensions</EnableEnhancedInstructionSet>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- VS2022's static C++ runtime is referenced LAST and by full path, so
+           the linker pulls ONLY the locale objects (the symbols we no longer
+           stub) from it; everything else resolves from our objs + RXDK first. -->
+      <AdditionalDependencies>xboxkrnl.lib;libcmt.lib;libcpmt.lib;oldnames.lib;xapilib.lib;d3d8.lib;d3dx8.lib;xgraphics.lib;dsound.lib</AdditionalDependencies>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <AdditionalOptions>/ALTERNATENAME:___CxxFrameHandler3=___CxxFrameHandler "/ALTERNATENAME:??_L@YGXPAXIIP6EX0@Z1@Z=??_L@YGXPAXIHP6EX0@Z1@Z" "/ALTERNATENAME:??_M@YGXPAXIIP6EX0@Z@Z=??_M@YGXPAXIHP6EX0@Z@Z" /ignore:4254 /FORCE:MULTIPLE %(AdditionalOptions)</AdditionalOptions>
+      <GenerateMapFile>true</GenerateMapFile>
+      <FixedBaseAddress>false</FixedBaseAddress>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+    </Link>
+    <PostBuildEvent>
+      <Message>Packaging "Flycast X" XBE + XISO (id 0x5452DC01)...</Message>
+      <Command>"$(RXDK_LIBS)bin\patchSubsystem.exe" -i="$(OutDir)$(TargetFileName)" -s=0x000E
+"$(RXDK_LIBS)bin\imagebld.exe" /in:"$(OutDir)$(TargetFileName)" /out:"$(OutDir)$(TargetName).xbe" /nologo /stack:131072 /debug /nolibwarn /testid:"0x5452DC01" /testname:"Flycast X"
+if not exist "$(OutDir)Build\$(ProjectName)\Media" mkdir "$(OutDir)Build\$(ProjectName)\Media"
+if exist "$(ProjectDir)Media" xcopy /E /I /Y "$(ProjectDir)Media\*" "$(OutDir)Build\$(ProjectName)\Media\"
+copy /Y "$(OutDir)$(TargetName).xbe" "$(OutDir)Build\$(ProjectName)\default.xbe"
+if not exist "$(OutDir)XISO" mkdir "$(OutDir)XISO"
+"$(RXDK_LIBS)bin\xdvdfs.exe" pack "$(OutDir)Build\$(ProjectName)" "$(OutDir)XISO\$(ProjectName).iso"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <!-- Bring-up batch 2: CPU heart + core scaffolding. Surfaces the dominant
+         error categories (windows.h, intrinsics) to fix once, benefit everywhere.
+         Known replace/stub-later files are deliberately excluded (serial.cpp,
+         oslib.cpp, win_vmem.cpp, net-heavy, naomi-net). -->
+    <!-- Xbox shell: entry point + host abstraction + modern-STL runtime shim -->
+    <ClCompile Include="main_xbox.cpp" />
+    <ClCompile Include="xbox_host.cpp" />
+    <ClCompile Include="xbox_oslib.cpp" />
+    <ClCompile Include="xbox_cpprt.cpp" />
+    <ClCompile Include="xbox_storage.cpp" />
+    <ClCompile Include="xbox_stubs2.cpp" />
+    <ClCompile Include="xbox_naomi.cpp" />
+    <ClCompile Include="xbox_d3d8_renderer.cpp" />
+    <ClCompile Include="xbox_locale.cpp" />
+    <!-- xbox_locale_deps.cpp removed from build: stale VS-objects-era kernel32 /
+         GetLocaleInfoEx bridges. The hand-written locale reads _Get* directly. -->
+    <ClCompile Include="xbox_stl_shim.cpp" />
+    <ClCompile Include="xbox_crt_shim.cpp">
+      <AdditionalOptions>/arch:SSE /Zc:sizedDealloc- /Zc:threadSafeInit- /Gy /Oi- %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <!-- Overrides bm_vmem_pagefill (fills only committed lower 32MB) and
+         supplies virtmem::prepare_jit_block. Must link before flycast core
+         wildcards so /FORCE:MULTIPLE picks our versions. -->
+    <ClCompile Include="xbox_dynarec_shim.cpp" />
+    <ClCompile Include="xbox_fault_handler.cpp" />
+    <!-- root -->
+    <ClCompile Include="$(FLY)\core\stdclass.cpp" />
+    <ClCompile Include="$(FLY)\core\emulator.cpp" />
+    <ClCompile Include="$(FLY)\core\nullDC.cpp" />
+    <ClCompile Include="$(FLY)\core\serialize.cpp" />
+    <ClCompile Include="$(FLY)\core\cheats.cpp" />
+    <!-- cfg -->
+    <ClCompile Include="$(FLY)\core\cfg\cfg.cpp" />
+    <ClCompile Include="$(FLY)\core\cfg\cl.cpp" />
+    <ClCompile Include="$(FLY)\core\cfg\ini.cpp" />
+    <ClCompile Include="$(FLY)\core\cfg\option.cpp" />
+    <!-- hw/sh4 : interpreter + modules + dyna frontend + x86 JIT backend -->
+    <ClCompile Include="$(FLY)\core\hw\sh4\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\sh4\interpr\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\sh4\modules\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\sh4\dyna\*.cpp" />
+    <!-- x86 SH-4 JIT (Xbyak-based). Guarded by FEAT_SHREC==DYNAREC_JIT && HOST_CPU==CPU_X86 inside. -->
+    <ClCompile Include="$(FLY)\core\rec-x86\*.cpp" />
+    <!-- unwind_info.cpp is already pulled in by the $(FLY)\core\windows\*.cpp wildcard below. -->
+
+    <!-- hw/mem -->
+    <ClCompile Include="$(FLY)\core\hw\mem\*.cpp" />
+    <!-- ============ Bring-up batch 3: remaining emulation subsystems ======== -->
+    <!-- hw/aica: FEAT_DSPREC=DYNAREC_NONE => interpreter DSP. dsp_x86.cpp must be
+         excluded (sizeof(CodeBuffer)=4 bug on 32-bit MSVC); the other arch DSP
+         backends are wrong-arch. dsp.cpp drives the interpreter path. -->
+    <ClCompile Include="$(FLY)\core\hw\aica\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\aica\dsp_arm32.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\aica\dsp_arm64.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\aica\dsp_x64.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\aica\dsp_x86.cpp" />
+    <!-- hw/arm7 (exclude AREC backends) -->
+    <ClCompile Include="$(FLY)\core\hw\arm7\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\arm7\arm7_rec_arm32.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\arm7\arm7_rec_arm64.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\arm7\arm7_rec_x64.cpp" />
+    <!-- hw/pvr, holly, maple, gdrom, flashrom -->
+    <ClCompile Include="$(FLY)\core\hw\pvr\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\holly\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\maple\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\gdrom\*.cpp" />
+    <ClCompile Include="$(FLY)\core\hw\flashrom\*.cpp" />
+    <!-- reios (HLE BIOS) -->
+    <ClCompile Include="$(FLY)\core\reios\*.cpp" />
+    <!-- imgread (exclude cdio = USE_LIBCDIO) -->
+    <ClCompile Include="$(FLY)\core\imgread\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\imgread\cdio.cpp" />
+    <!-- rend: renderer-agnostic + null renderer only -->
+    <ClCompile Include="$(FLY)\core\rend\TexCache.cpp" />
+    <ClCompile Include="$(FLY)\core\rend\sorter.cpp" />
+    <ClCompile Include="$(FLY)\core\rend\texconv.cpp" />
+    <ClCompile Include="$(FLY)\core\rend\transform_matrix.cpp" />
+    <ClCompile Include="$(FLY)\core\rend\CustomTexture.cpp" />
+    <ClCompile Include="$(FLY)\core\rend\osd.cpp" />
+    <ClCompile Include="$(FLY)\core\rend\norend\norend.cpp" />
+    <!-- audio: dispatcher + null backend -->
+    <ClCompile Include="$(FLY)\core\audio\audiostream.cpp" />
+    <ClCompile Include="$(FLY)\core\audio\audiobackend_null.cpp" />
+    <!-- input (dreampotato = DreamPicoPort device, pulls asio -> excluded) -->
+    <ClCompile Include="$(FLY)\core\input\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\input\dreampotato.cpp" />
+    <!-- archive: 7z + rzip (archive.cpp deferred: pulls libzip via ZipArchive.h) -->
+    <ClCompile Include="$(FLY)\core\archive\7zArchive.cpp" />
+    <ClCompile Include="$(FLY)\core\archive\rzip.cpp" />
+    <!-- log: manager only (console listeners are per-OS, skipped) -->
+    <ClCompile Include="$(FLY)\core\log\LogManager.cpp" />
+    <!-- network: output only (rest stubbed) -->
+    <ClCompile Include="$(FLY)\core\network\output.cpp" />
+    <!-- ====== "Send it": real files we'd otherwise stub. Compile what works,
+                replace only what genuinely can't build on Xbox. ============== -->
+    <!-- oslib: most compiles (resources/storage helpers); exclude the desktop
+         ones (shlobj/rawinput/dirent/wininet/tinygettext) -> Xbox replacements. -->
+    <ClCompile Include="$(FLY)\core\oslib\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\storage.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\directory.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\oslib.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\rawinput.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\http_client.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\i18n.cpp" />
+    <ClCompile Remove="$(FLY)\core\oslib\resources.cpp" />  <!-- ZipArchive.h -> libzip -->
+
+    <!-- platform vmem/fault/unwind: replaced by xbox_host.cpp (malloc fallback) -->
+    <ClCompile Include="$(FLY)\core\windows\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\windows\win_vmem.cpp" />
+    <ClCompile Remove="$(FLY)\core\windows\fault_handler.cpp" />
+    <ClCompile Remove="$(FLY)\core\windows\rawinput.cpp" />
+    <ClCompile Remove="$(FLY)\core\windows\winmain.cpp" />  <!-- desktop entry; we have main_xbox.cpp -->
+    <!-- network: all stubbed in xbox_host.cpp (net_handshake.cpp pulls
+         null_modem.h winsock addrinfo; ggpo.cpp needs the GGPO lib) -->
+
+    <!-- hw/naomi: cart/loader/devices; exclude the networked ones -->
+    <ClCompile Include="$(FLY)\core\hw\naomi\*.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\naomi\naomi_network.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\naomi\netdimm.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\naomi\multiboard.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\naomi\naomi_m3comm.cpp" />
+    <ClCompile Include="$(FLY)\core\log\ConsoleListenerWin.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- ================= C dependencies (for the final link) ================
+         ObjectFileName subdirs keep same-named .c files (the two lzma trees,
+         zstd-vs-xxHash) from colliding in a flat IntDir. -->
+    <!-- zlib (CHD + rzip save states) -->
+    <ClCompile Include="$(FLY)\core\deps\libchdr\deps\zlib-1.3.1\*.c">
+      <ObjectFileName>$(IntDir)zlib\</ObjectFileName>
+    </ClCompile>
+    <!-- libchdr (CHD disc images) -->
+    <ClCompile Include="$(FLY)\core\deps\libchdr\src\*.c">
+      <ObjectFileName>$(IntDir)libchdr\</ObjectFileName>
+    </ClCompile>
+    <!-- zstd (libchdr dependency) -->
+    <ClCompile Include="$(FLY)\core\deps\libchdr\deps\zstd-1.5.6\lib\common\*.c">
+      <ObjectFileName>$(IntDir)zstd\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(FLY)\core\deps\libchdr\deps\zstd-1.5.6\lib\decompress\*.c">
+      <ObjectFileName>$(IntDir)zstd\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(FLY)\core\deps\libchdr\deps\zstd-1.5.6\lib\compress\*.c">
+      <ObjectFileName>$(IntDir)zstd\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="$(FLY)\core\deps\libchdr\deps\zstd-1.5.6\lib\dictBuilder\*.c">
+      <ObjectFileName>$(IntDir)zstd\</ObjectFileName>
+    </ClCompile>
+    <!-- libchdr's bundled lzma (decode only; LzmaEnc.c = encoder needs the
+         absent LzFindMt.h, and we never compress CHDs) -->
+    <ClCompile Include="$(FLY)\core\deps\libchdr\deps\lzma-24.05\src\*.c">
+      <ObjectFileName>$(IntDir)chdlzma\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Remove="$(FLY)\core\deps\libchdr\deps\lzma-24.05\src\LzmaEnc.c" />
+    <!-- core 7-zip lzma (core/archive/7zArchive.cpp) -->
+    <ClCompile Include="$(FLY)\core\deps\lzma\*.c">
+      <ObjectFileName>$(IntDir)corelzma\</ObjectFileName>
+    </ClCompile>
+    <!-- xxHash -->
+    <ClCompile Include="$(FLY)\core\deps\xxHash\xxhash.c">
+      <ObjectFileName>$(IntDir)xxhash\</ObjectFileName>
+    </ClCompile>
+    <!-- libelf (reios ELF loader) -->
+    <ClCompile Include="$(FLY)\core\deps\libelf\src\*.c">
+      <ObjectFileName>$(IntDir)libelf\</ObjectFileName>
+    </ClCompile>
+    <!-- chdpsr (CDI parsing) -->
+    <ClCompile Include="$(FLY)\core\deps\chdpsr\cdipsr.cpp" />
+    <!-- md5 -->
+    <ClCompile Include="$(FLY)\core\deps\md5\md5.cpp" />
+    <!-- nowide (UTF-8 stdio/file wrappers). Exclude the console (iostream.cpp)
+         and env-var (cstdlib.cpp) wrappers: they use desktop Win32 console/env
+         APIs the XDK lacks, and the core only uses nowide for file paths. -->
+    <ClCompile Include="$(FLY)\core\deps\nowide\src\*.cpp">
+      <ObjectFileName>$(IntDir)nowide\</ObjectFileName>
+    </ClCompile>
+    <ClCompile Remove="$(FLY)\core\deps\nowide\src\iostream.cpp" />
+    <ClCompile Remove="$(FLY)\core\deps\nowide\src\cstdlib.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

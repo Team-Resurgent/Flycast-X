@@ -95,3 +95,28 @@ void xbox_PollInput()
         m.fullAxes[PJAI_Y1] = ly;
     }
 }
+
+// Raw first-connected-pad read for the pre-boot file browser (no maple mapping).
+// Handles hot-plug like xbox_PollInput. Returns false if no pad is connected.
+extern "C" bool xbox_ReadRawPad(XINPUT_STATE* out)
+{
+    DWORD ins = 0, rem = 0;
+    if (XGetDeviceChanges(XDEVICE_TYPE_GAMEPAD, &ins, &rem))
+    {
+        for (DWORD i = 0; i < NUM_PADS; i++)
+        {
+            if ((rem & (1u << i)) && s_pads[i]) { XInputClose(s_pads[i]); s_pads[i] = NULL; }
+            if (ins & (1u << i))                  s_pads[i] = XInputOpen(XDEVICE_TYPE_GAMEPAD, i, XDEVICE_NO_SLOT, NULL);
+        }
+    }
+    for (int i = 0; i < NUM_PADS; i++)
+    {
+        if (s_pads[i])
+        {
+            ZeroMemory(out, sizeof(*out));
+            if (XInputGetState(s_pads[i], out) == ERROR_SUCCESS)
+                return true;
+        }
+    }
+    return false;
+}

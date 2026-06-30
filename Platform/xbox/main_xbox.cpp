@@ -167,6 +167,9 @@ void os_InstallFaultHandler();
 // Xbox controller -> DC maple input (xbox_input.cpp).
 void xbox_InitInput();
 void xbox_PollInput();
+// Pre-boot file browser (xbox_filebrowser.cpp). Returns the chosen disc-image
+// path, or "" to boot the Dreamcast BIOS/dashboard.
+extern "C" const char* xbox_RunFileBrowser();
 
 static bool runEmu()
 {
@@ -195,14 +198,16 @@ static bool runEmu()
             DBG("FLYCAST: *** D3D8 renderer Init FAILED ***\n");
         DBG("FLYCAST: emu.init()\n");
         emu.init();
-        // Boot a real game disc. The Media tree is packed to D:\Media\ by the
-        // post-build xcopy/xdvdfs step, so this GDI + its 27 tracks ride along
-        // inside the ISO. Pass "" instead to boot to the BIOS menu.
-        static const char* GAME_PATH = "D:\\Media\\Mr. Driller [USA]\\disc.gdi";
+        // Bring up the controller(s) early so the pre-boot file browser can read
+        // input, then let the user navigate the drives and pick a disc image --
+        // or choose "Boot Dreamcast BIOS" which returns "" (boots the DC menu).
+        xbox_InitInput();
+        DBG("FLYCAST: running file browser...\n");
+        const char* gamePath = xbox_RunFileBrowser();   // blocks until selection
         DBG("FLYCAST: emu.loadGame(\"");
-        DBG(GAME_PATH);
+        DBG(gamePath[0] ? gamePath : "<DREAMCAST BIOS>");
         DBG("\")\n");
-        emu.loadGame(GAME_PATH);
+        emu.loadGame(gamePath);
         // loadGame() runs config::Settings::reset(), which re-defaults
         // ThreadedRendering back to TRUE -- undoing the override we set before
         // loadGame. Re-assert it FALSE here so emu.start() takes the
@@ -216,8 +221,7 @@ static bool runEmu()
         DBG("FLYCAST: emu.start()\n");
         emu.start();
         DBG("FLYCAST: emu.start() RETURNED; entering render loop\n");
-        // Bring up the Xbox controller(s) -> DC maple input.
-        xbox_InitInput();
+        // (controllers already brought up before the file browser, above)
         // YELLOW baseline until the D3D8 renderer draws the first DC frame over it.
         clearScreen(D3DCOLOR_XRGB(160, 160, 0));
         // PERF PROBE: split per-frame wall time into render(D3D8) vs emulation

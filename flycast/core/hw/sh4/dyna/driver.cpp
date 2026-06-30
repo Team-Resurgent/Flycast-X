@@ -218,23 +218,33 @@ DynarecCodeEntryPtr DYNACALL rdv_BlockCheckFail(u32 addr)
 {
 	DEBUG_LOG(DYNAREC, "rdv_BlockCheckFail @ %08x", addr);
 	u32 blockcheck_failures = 0;
-	if (mmu_enabled())
+	// Graceful SMC handling for BOTH MMU and non-MMU. The old non-MMU path did a
+	// full ResetCache() on every block-check failure, which also wipes
+	// unprotected_pages (blockmanager.cpp:352) -> every RAM page gets re-protected
+	// -> the next guest write SMC-faults -> unprotect+discard -> recompile -> the
+	// block-check fails again -> ResetCache ... a self-sustaining storm (observed
+	// smc=424 faults/300ms, scheduler frozen, delta=0) that hangs SEGA "Shinobi
+	// Library" games (Sonic Adventure, Marvel vs Capcom 2) -- they run with the
+	// MMU OFF and write data into a page that also holds code. Instead, discard
+	// only the failing block and after a few failures mark it an smc_hotspot so it
+	// recompiles into the temp buffer with a runtime block-check and NO page
+	// protection -- exactly what the MMU path already did. No cache nuke, so
+	// unprotected_pages survives and the page stops re-faulting.
+	RuntimeBlockInfoPtr block = bm_GetBlock(addr);
+	if (block)
 	{
-		RuntimeBlockInfoPtr block = bm_GetBlock(addr);
-		if (block)
+		blockcheck_failures = block->blockcheck_failures + 1;
+		if (blockcheck_failures > 5)
 		{
-			blockcheck_failures = block->blockcheck_failures + 1;
-			if (blockcheck_failures > 5)
-			{
-				bool inserted = smc_hotspots.insert(addr).second;
-				if (inserted)
-					DEBUG_LOG(DYNAREC, "rdv_BlockCheckFail SMC hotspot @ %08x fails %d", addr, blockcheck_failures);
-			}
-			bm_DiscardBlock(block.get());
+			bool inserted = smc_hotspots.insert(addr).second;
+			if (inserted)
+				DEBUG_LOG(DYNAREC, "rdv_BlockCheckFail SMC hotspot @ %08x fails %d", addr, blockcheck_failures);
 		}
+		bm_DiscardBlock(block.get());
 	}
-	else
+	else if (!mmu_enabled())
 	{
+		// No block found at this address (rare) -- fall back to the old reset.
 		Sh4cntx.pc = addr;
 		Sh4Recompiler::Instance->ResetCache();
 	}

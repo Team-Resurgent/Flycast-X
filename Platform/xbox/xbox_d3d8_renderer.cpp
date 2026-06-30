@@ -155,7 +155,7 @@ public:
     {
         if (!d3dtex
             && FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
-                          D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &d3dtex)))
+                          D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &d3dtex)))
             return;
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
@@ -180,7 +180,7 @@ public:
         {
             if (!d3dtex
                 && FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
-                              D3DFMT_P8, D3DPOOL_MANAGED, &d3dtex)))
+                              D3DFMT_P8, D3DPOOL_DEFAULT, &d3dtex)))
                 return;
             D3DLOCKED_RECT lr;
             if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))

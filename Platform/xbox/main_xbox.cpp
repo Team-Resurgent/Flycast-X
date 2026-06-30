@@ -64,11 +64,11 @@ static void setupLogging()
     LogManager* lm = LogManager::GetInstance();
     if (!lm) { DBG("FLYCAST: LogManager is null\n"); return; }
     DBG("FLYCAST: SetLogLevel...\n");
-    // INFO so the boot/GD-ROM path is visible (debugging MvC2's boot hang). Logs
-    // go via OutputDebugStringA (serial, slow), so SILENCE the high-frequency
-    // categories -- keep only BOOT/COMMON/GDROM/REIOS/HOLLY/MEMORY/FLASHROM/
-    // NAOMI/VMEM, which is exactly the boot+disc activity we want to trace.
-    lm->SetLogLevel(LogTypes::LINFO);
+    // WARNING for speed: every log line goes out OutputDebugStringA (serial, slow)
+    // and stalls the emulator. INFO was for tracing the MvC2 boot hang (fixed:
+    // RAM-mirror fault). Raise to LINFO + re-enable categories below if you need
+    // to trace a new boot hang again.
+    lm->SetLogLevel(LogTypes::LWARNING);
     static const LogTypes::LOG_TYPE kQuiet[] = {
         LogTypes::AICA, LogTypes::AICA_ARM, LogTypes::AUDIO, LogTypes::DYNAREC,
         LogTypes::INPUT, LogTypes::INTERPRETER, LogTypes::JVS, LogTypes::MAPLE,
@@ -107,6 +107,8 @@ extern "C" volatile unsigned g_fault_rewrite;
 extern "C" volatile unsigned g_fault_ramsmc;
 extern "C" volatile unsigned g_fault_vram;
 extern "C" volatile unsigned g_fault_unhandled;
+extern "C" volatile unsigned g_fault_lastaddr;
+extern "C" volatile unsigned g_fault_lastpc;
 
 static unsigned g_sehCode = 0, g_sehAddr = 0;
 static int sehFilter(struct _EXCEPTION_POINTERS* ep)
@@ -236,6 +238,11 @@ static void dumpGuestAscii(const char* tag, u32 vaddr, int bytes)
     }
 }
 
+// Per-frame SH-4 heartbeat + wedge register-dump tracing. OFF for speed (each
+// print blocks on the serial debug link; the wedge detector also false-fires in
+// any hot game loop). Flip to true to debug a new boot/hang.
+static const bool kDebugTrace = false;
+
 static volatile unsigned g_mainLoopBeat = 0;
 static DWORD WINAPI watchdogThread(LPVOID)
 {
@@ -270,6 +277,16 @@ static DWORD WINAPI watchdogThread(LPVOID)
             wsprintfA(b, "FAULTS in 300ms freeze: rw=%u smc=%u fpcb=%u\n",
                 rw1 - rw0, smc1 - smc0, fp1 - fp0);
             OutputDebugStringA(b);
+            // WHERE are the SMC faults landing? Sample the last faulting guest addr
+            // (host VA) + the host PC doing the write, 6x across 180ms. All the same
+            // => one page re-protected in a loop; spread => many pages churning.
+            for (int s = 0; s < 6; ++s)
+            {
+                wsprintfA(b, "  smc-fault[%d] addr=%08x hostpc=%08x\n",
+                    s, g_fault_lastaddr, g_fault_lastpc);
+                OutputDebugStringA(b);
+                Sleep(30);
+            }
 
             // HOST x86 state of the frozen emu thread. Suspend/read/resume FIRST,
             // then print (don't print while it's suspended -> serial-lock deadlock).
@@ -385,7 +402,8 @@ static bool runEmu()
         LARGE_INTEGER wallBase; QueryPerformanceCounter(&wallBase);
         u64 emuClkBase = sh4_sched_now64();
         g_emuTid = GetCurrentThreadId();                        // for the watchdog's host-EIP read
-        CreateThread(NULL, 0, watchdogThread, NULL, 0, NULL);   // SH-4 hang detector
+        if (kDebugTrace)
+            CreateThread(NULL, 0, watchdogThread, NULL, 0, NULL);   // SH-4 hang detector
         for (;;)                       // run the BIOS forever; renderer presents each frame
         {
             g_mainLoopBeat++;          // watchdog liveness tick
@@ -402,7 +420,7 @@ static bool runEmu()
             static int  s_stuck = 0;
             static bool s_dumped = false;
             unsigned curPc = (unsigned)Sh4cntx.pc;
-            if ((s_hb++ & 7) == 0)
+            if (kDebugTrace && (s_hb++ & 7) == 0)
             {
                 char hb[80];
                 wsprintfA(hb, "HB %u pc=%08x\n", s_hb, curPc);
@@ -463,9 +481,15 @@ static bool runEmu()
                 wallBase = wnow;
                 emuClkBase = sh4_sched_now64();
 
+                // Free physical RAM (Xbox is 64MB retail / 128MB devkit). Watch
+                // this trend: a steady decline under gameplay = a leak (textures,
+                // blocks); a stable low floor = just a big working set.
+                MEMORYSTATUS ms; ms.dwLength = sizeof(ms); GlobalMemoryStatus(&ms);
+                int freeMB = (int)(ms.dwAvailPhys / (1024 * 1024));
+
                 char buf[256];
-                wsprintfA(buf, "FLYCAST PERF: %dms REAL %dfps speed=%d%% | flt=%u fpcb=%u rw=%u smc=%u vram=%u bad=%u pc=%08x\n",
-                          totalMs, realFps, speedPct, faults,
+                wsprintfA(buf, "FLYCAST PERF: %dms REAL %dfps speed=%d%% freeMB=%d | flt=%u fpcb=%u rw=%u smc=%u vram=%u bad=%u pc=%08x\n",
+                          totalMs, realFps, speedPct, freeMB, faults,
                           dFpcb, dRewr, dSmc, dVram, dUnh, (unsigned)Sh4cntx.pc);
                 OutputDebugStringA(buf);
                 emuUsAcc = 0;

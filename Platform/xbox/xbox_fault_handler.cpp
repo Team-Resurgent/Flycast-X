@@ -69,7 +69,24 @@ extern "C" int xbox_FastmemFault(EXCEPTION_POINTERS* ep)
 
     // ram watcher (GGPO; no-op here) / SMC code protection / texture protection
     if (memwatch::writeAccess(address))            return EXCEPTION_CONTINUE_EXECUTION;
-    if (bm_RamWriteAccess(address))                { ++g_fault_ramsmc; return EXCEPTION_CONTINUE_EXECUTION; }
+
+    // SMC handling is restricted to the CANONICAL 16MB RAM (SH4 0x0C000000), the
+    // only RAM region we commit + write-protect. The DC mirrors that 16MB three
+    // more times across the 0x0C-0x0F physical area; those mirror pages are left
+    // reserved (committing 3x16MB would blow the 64MB Xbox budget and wouldn't be
+    // coherent anyway). A WinCE/MMU game can map a page to a mirror physical addr
+    // (e.g. 0x0D2D2D0A -> host 0x11E82D0A) and write through it. bm_RamWriteAccess
+    // masks to 16MB so it would "accept" that fault, unprotect the 0x0C page, and
+    // resume -- but the mirror page stays unbacked, so the SAME write re-faults
+    // endlessly (observed: one addr, smc storm, scheduler starved -> hang). So
+    // only canonical writes are SMC; mirror accesses fall through to the fastmem
+    // rewrite below, whose slow handler masks the address back to real RAM
+    // (coherent) and stops faulting.
+    {
+        u8* canon = addrspace::ram_base + 0x0C000000;
+        if (address >= canon && address < canon + RAM_SIZE && bm_RamWriteAccess(address))
+        { ++g_fault_ramsmc; g_fault_lastaddr = (unsigned)(size_t)address; g_fault_lastpc = ep->ContextRecord->Eip; return EXCEPTION_CONTINUE_EXECUTION; }
+    }
     if (VramLockedWrite(address))                  { ++g_fault_vram;   return EXCEPTION_CONTINUE_EXECUTION; }
     // FPCB jump-table demand paging (commit + fill the reserved page).
     if (addrspace::bm_lockedWrite(address))        { ++g_fault_fpcb;   return EXCEPTION_CONTINUE_EXECUTION; }

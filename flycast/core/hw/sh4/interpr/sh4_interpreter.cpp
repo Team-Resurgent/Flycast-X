@@ -170,16 +170,28 @@ void Sh4Interpreter::ExecuteDelayslot_RTE()
 	}
 }
 
+// Diagnostic: counts how often the scheduler tick runs. If this FREEZES while
+// the main loop is hung, the dynarec is spinning in a JIT block that never
+// reaches intc_sched (the block prologue) -- the real bug location.
+extern "C" volatile unsigned g_uintc_calls = 0;
+
 // every SH4_TIMESLICE cycles
 int UpdateSystem_INTC()
 {
+	g_uintc_calls++;
 	Sh4cntx.sh4_sched_next -= SH4_TIMESLICE;
 	if (Sh4cntx.sh4_sched_next < 0)
 		sh4_sched_tick(SH4_TIMESLICE);
-	if (Sh4cntx.interrupt_pend)
-		return UpdateINTC();
-	else
-		return 0;
+	int rv = Sh4cntx.interrupt_pend ? UpdateINTC() : 0;
+	// The dynarec only leaves its mainloop when this returns nonzero. The
+	// scheduler tick above can stop the CPU (vblank's Stop() -> CpuRunning=0) WITH
+	// NO interrupt pending -- e.g. a game idling with interrupts masked (SEGA
+	// Shinobi init: Sonic Adventure, MvC2, ...). Without forcing a re-dispatch
+	// here the dynarec spins forever (CpuRunning=0, interrupt_pend=0). The
+	// interpreter is unaffected: it checks CpuRunning itself and ignores this.
+	if (!Sh4cntx.CpuRunning)
+		rv = 1;
+	return rv;
 }
 
 void Sh4Interpreter::Init()

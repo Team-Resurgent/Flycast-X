@@ -219,6 +219,20 @@ void bm_AddBlock(RuntimeBlockInfo* blk)
 	}
 	blkmap[(void*)block->code] = block;
 
+	// In full-MMU mode (WinCE games: Sonic Adventure, MvC2) a TLB remap can leave
+	// a stale block registered at this physical addr -- it was compiled under a
+	// virtual->physical mapping that has since changed, the block-check failed, we
+	// discarded the block at the OLD physical addr, but recompiled at the NEW one
+	// whose FPCB slot still holds an older block. Rather than assert+die, take over
+	// the slot: discard the stale block (same physical RAM => same SH4 code, so the
+	// replacement is equivalent). For non-MMU games the slot is always empty here,
+	// so this is a no-op and nothing changes.
+	if ((void*)bm_GetCode(block->addr) != (void*)ngen_FailedToFindBlock)
+	{
+		RuntimeBlockInfoPtr stale = bm_GetBlock(block->addr);
+		if (stale)
+			bm_DiscardBlock(stale.get());
+	}
 	verify((void*)bm_GetCode(block->addr) == (void*)ngen_FailedToFindBlock);
 	FPCA(block->addr) = (DynarecCodeEntryPtr)CC_RW2RX(block->code);
 
@@ -304,6 +318,11 @@ void bm_Reset()
 	{
 		virtmem::region_unlock(&mem_b[0], RAM_SIZE);
 	}
+	// Hard reset: forget all data-write history so pages get protected fresh as
+	// blocks recompile. (The frequent cache-full bm_ResetCache no longer does this
+	// -- see the note there.)
+	if (unprotected_pages != nullptr)
+		memset(unprotected_pages, 0, pageCount);
 }
 
 void bm_LockPage(u32 addr, u32 size)
@@ -349,7 +368,14 @@ void bm_ResetCache()
 	for (size_t i = 0; i < pageCount; i++)
 		blocks_per_page[i].clear();
 
-	memset(unprotected_pages, 0, pageCount);
+	// NOTE: unprotected_pages is deliberately NOT cleared here. This is the
+	// frequent cache-full reset; wiping it re-protects every RAM page, so a game
+	// writing data into a code page (SEGA Shinobi-library WinCE titles: Sonic
+	// Adventure, Marvel vs Capcom 2 -- they run with the MMU on) immediately
+	// SMC-faults again, gets discarded+recompiled, fills the cache, resets, and
+	// re-protects... a storm (smc=424/300ms) that starves the scheduler and hangs
+	// the game. A page that has seen a data write stays unprotected (block-check
+	// still catches real SMC). It IS cleared on a hard reset (bm_Reset).
 
 #ifdef DYNA_OPROF
 	if (oprofHandle)
@@ -383,6 +409,7 @@ void bm_Init()
 {
 	pageCount = RAM_SIZE_MAX / PAGE_SIZE;
 	unprotected_pages = new bool[pageCount];
+	memset(unprotected_pages, 0, pageCount);   // new[] leaves it uninitialized
 	blocks_per_page = new std::set<RuntimeBlockInfo*>[pageCount];
 
 #ifdef DYNA_OPROF

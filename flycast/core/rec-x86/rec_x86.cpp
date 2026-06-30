@@ -514,6 +514,11 @@ void X86Compiler::genMainloop()
 	add(dword[&sh4ctx.cycle_counter], SH4_TIMESLICE);
 	mov(dword[&sh4ctx.pc], ecx);
 	call((void *)UpdateSystem_INTC);
+	// Re-dispatch (re-check CpuRunning) only when UpdateSystem_INTC signals it:
+	// an interrupt is pending, OR the CPU was stopped (UpdateSystem_INTC returns 1
+	// when !CpuRunning -- see sh4_interpreter.cpp). Otherwise ret and continue the
+	// block. (An earlier unconditional jmp(do_iter) here was a wrong fix for the
+	// Shinobi hang -- that was the RAM-mirror fault bug -- and only added overhead.)
 	cmp(eax, 0);
 	jnz(do_iter);
 	ret();

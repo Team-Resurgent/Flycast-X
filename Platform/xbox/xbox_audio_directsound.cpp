@@ -10,22 +10,33 @@
   Why not reuse core/audio/audiobackend_directsound.cpp?
     The desktop backend targets PC DirectSound8: it needs an HWND
     (SetCooperativeLevel) and a separate IDirectSoundNotify interface with
-    position-notification events. Neither exists on Xbox -- there is no
-    windowing, DirectSoundCreate takes no "8", and IDirectSoundNotify is folded
-    into the buffer. So we use the proven Xbox streaming pattern instead
-    (matches Super-Mario-World-X / Zelda-A-Link-To-The-Past-X xbox_audio.cpp):
+    position-notification events. Neither exists on Xbox -- no windowing,
+    DirectSoundCreate takes no "8", IDirectSoundNotify is folded into the
+    buffer. So we use the proven Xbox streaming pattern instead (matches
+    Super-Mario-World-X / Zelda-A-Link-To-The-Past-X xbox_audio.cpp):
     one looping secondary buffer + a feeder thread that polls the play cursor
-    and refills the space the hardware has consumed.
+    and refills the region the hardware has consumed.
 
-  Threading model (mirrors the desktop backend's intent):
-    - push()  : AICA/emu side. Writes frames into a lock-free RingBuffer.
-                Blocks on s_pushWait when the ring is full (wait == true).
-    - feeder  : polls IDirectSoundBuffer::GetCurrentPosition, copies whatever
-                the ring holds into the freed region (silence on underrun),
-                then signals s_pushWait so push() can proceed.
+  Threading / pacing:
+    - push()  : AICA/emu side (main thread). Writes frames into a lock-free
+                SPSC FIFO. Blocks on s_pushWait when the FIFO is full IF the
+                caller asked to wait (config::LimitFPS) -- this push-block is
+                what frame-limits the emulator to realtime.
+    - feeder  : polls IDirectSoundBuffer::GetCurrentPosition and refills the
+                played-past region with whatever the FIFO holds, padding only
+                the genuine shortfall with silence (see FEEDING below).
+
+  FEEDING (why sub-block, not whole-block):
+    The hardware play cursor advances continuously; each feeder pass we refill
+    *exactly* the bytes it freed (frame-aligned), reading as much real audio as
+    the FIFO currently has and zero-filling only the true remainder. Feeding in
+    rigid 512-sample blocks instead would inject a whole block of silence
+    whenever a block isn't 100% ready -- turning small emulator jitter into
+    audible chunky dropouts. Sub-block feeding keeps glitches proportional to
+    the actual underrun.
 ==========================================================================*/
 
-#include "audio/audiostream.h"   // AudioBackend, RingBuffer, SAMPLE_COUNT
+#include "audio/audiostream.h"   // AudioBackend, SAMPLE_COUNT
 #include "cfg/option.h"          // config::AudioBufferSize
 
 #include <xtl.h>
@@ -38,18 +49,98 @@
 #include <dsound.h>
 
 // Dreamcast audio is stereo 16-bit @ 44100 Hz. Flycast always calls push()
-// with exactly SAMPLE_COUNT frames, so one "block" is the natural feed unit.
+// with exactly SAMPLE_COUNT frames.
 static const DWORD AUDIO_SAMPLE_RATE = 44100;
 static const DWORD AUDIO_CHANNELS    = 2;
 static const DWORD AUDIO_BITS        = 16;
 static const DWORD FRAME_BYTES       = AUDIO_CHANNELS * (AUDIO_BITS / 8); // 4
 static const DWORD BLOCK_BYTES       = SAMPLE_COUNT * FRAME_BYTES;        // 2048
 
-// The hardware ring DirectSound loops over. 4 blocks ~= 46 ms of latency,
-// large enough to ride out emulator frame-time jitter on xemu/hardware,
-// small enough to stay responsive.
-static const DWORD DS_BLOCKS    = 4;
-static const DWORD DS_BUF_BYTES = DS_BLOCKS * BLOCK_BYTES;                // 8192
+// The hardware ring DirectSound loops over. 8 blocks ~= 93 ms of cushion --
+// enough headroom to ride out emulator frame-time jitter on xemu/hardware
+// without the play cursor outrunning the feeder. (The emulator self-paces to
+// this via the push-block frame limiter, so a larger buffer just means more
+// jitter tolerance, not added latency drift.)
+static const DWORD DS_BLOCKS    = 8;
+static const DWORD DS_BUF_BYTES = DS_BLOCKS * BLOCK_BYTES;                // 16384
+
+// Largest slice we Lock() at once while refilling (keeps each lock bounded).
+static const DWORD FEED_CHUNK   = BLOCK_BYTES;
+
+// Dynamic Rate Control bounds. The play rate is allowed to bend this far from
+// nominal to match the emulator's actual speed. +-12% covers the observed
+// 88-100% range; the worst fault-storm dips (sub-70%) still glitch briefly, but
+// normal play stays smooth. 0.88x is ~2.2 semitones flat at the extreme --
+// barely noticeable and far preferable to constant crackle.
+static const double DRC_MIN_RATIO = 0.88;
+static const double DRC_MAX_RATIO = 1.06;   // emu rarely exceeds realtime; cap chipmunking
+static const double DRC_GAIN      = 0.20;   // proportional response to fill error
+static const double DRC_SMOOTH    = 0.15;   // low-pass on freq changes (anti-wobble)
+
+//--------------------------------------------------------------------------
+// Lock-free single-producer / single-consumer byte FIFO.
+//   producer = push() (emu thread), consumer = feeder thread.
+// x86 has acquire/release ordering for aligned word loads/stores, and there is
+// exactly one reader and one writer, so plain volatile cursors are safe here
+// (same approach as the reference ports' ring buffers).
+//--------------------------------------------------------------------------
+class ByteFifo
+{
+	std::vector<u8> buf;
+	volatile LONG   wpos = 0;   // byte write offset [0, size)
+	volatile LONG   rpos = 0;   // byte read  offset [0, size)
+
+	u32 cap() const { return (u32)buf.size(); }
+
+public:
+	void init(u32 bytes)
+	{
+		buf.assign(bytes, 0);
+		wpos = 0;
+		rpos = 0;
+	}
+
+	u32 readable() const
+	{
+		LONG w = wpos, r = rpos;
+		return (u32)((w - r + (LONG)cap()) % (LONG)cap());
+	}
+
+	u32 writable() const { return cap() - 1 - readable(); }
+	u32 capacity() const { return cap(); }
+
+	// Returns false (writes nothing) if it won't all fit.
+	bool write(const u8 *data, u32 n)
+	{
+		if (n > writable())
+			return false;
+		LONG w = wpos;
+		u32 first = (n < cap() - (u32)w) ? n : cap() - (u32)w;
+		memcpy(&buf[w], data, first);
+		if (n > first)
+			memcpy(&buf[0], data + first, n - first);
+		wpos = (LONG)(((u32)w + n) % cap());
+		return true;
+	}
+
+	// Reads up to n bytes (frame-aligned); returns bytes actually read.
+	u32 read(u8 *data, u32 n)
+	{
+		u32 avail = readable();
+		if (n > avail)
+			n = avail;
+		n &= ~(FRAME_BYTES - 1);   // never split a stereo frame
+		if (n == 0)
+			return 0;
+		LONG r = rpos;
+		u32 first = (n < cap() - (u32)r) ? n : cap() - (u32)r;
+		memcpy(data, &buf[r], first);
+		if (n > first)
+			memcpy(data + first, &buf[0], n - first);
+		rpos = (LONG)(((u32)r + n) % cap());
+		return n;
+	}
+};
 
 class XboxDirectSoundBackend : public AudioBackend
 {
@@ -57,22 +148,35 @@ class XboxDirectSoundBackend : public AudioBackend
 	LPDIRECTSOUNDBUFFER streamBuf   = nullptr;
 	DWORD               dsWritePos  = 0;   // our running write cursor into streamBuf
 
-	HANDLE              feederThread = nullptr;
+	HANDLE              feederThread  = nullptr;
 	volatile bool       feederRunning = false;
-	HANDLE              pushWait     = nullptr;  // signalled when ring space frees
+	HANDLE              pushWait      = nullptr;  // signalled when FIFO space frees
 
-	RingBuffer          ringBuffer;            // push() -> feeder hand-off
+	ByteFifo            fifo;                     // push() -> feeder hand-off
 
-	// Feeder thread: drain the ring into the region DirectSound has played past.
+	// --- Dynamic Rate Control (DRC) ------------------------------------------
+	// The emulator can't quite hold 1x realtime (it runs ~82-98% and dips on JIT
+	// fault storms), so the AICA produces audio slightly slower than DirectSound
+	// drains it -> chronic underrun = crackle, regardless of buffer size. DRC
+	// fixes this the way emulators do: instead of fighting the rate mismatch, we
+	// retune the DirectSound playback frequency to TRACK the actual production
+	// rate, holding the FIFO near half-full. Cost is a small, smooth pitch shift
+	// (proportional to how far below realtime the core is) instead of crackle.
+	double drcFreq      = (double)AUDIO_SAMPLE_RATE;  // current smoothed play rate
+	int    drcTick      = 0;
+	u32    fifoCapBytes = 0;
+
 	static DWORD WINAPI feederTrampoline(LPVOID self)
 	{
 		((XboxDirectSoundBackend *)self)->feederMain();
 		return 0;
 	}
 
+	// Refill everything the hardware has played past, frame-aligned: real audio
+	// where the FIFO has it, silence only for the genuine shortfall.
 	void feederMain()
 	{
-		BYTE block[BLOCK_BYTES];
+		BYTE scratch[FEED_CHUNK];
 		while (feederRunning)
 		{
 			DWORD playCursor = 0, writeCursorUnused = 0;
@@ -82,41 +186,52 @@ class XboxDirectSoundBackend : public AudioBackend
 				continue;
 			}
 
-			// Bytes the hardware has consumed since our last write position.
+			// Bytes freed since our last write position (= what to refill now).
 			DWORD avail = (playCursor >= dsWritePos)
 				? (playCursor - dsWritePos)
 				: (DS_BUF_BYTES - dsWritePos + playCursor);
+			avail &= ~(FRAME_BYTES - 1);
 
-			bool signalled = false;
-			while (avail >= BLOCK_BYTES)
+			bool drainedSome = false;
+			while (avail > 0)
 			{
-				// Pull one block from the ring; on underrun emit silence so the
-				// looping buffer never replays stale audio (avoids buzzing).
-				if (!ringBuffer.read(block, BLOCK_BYTES))
-					memset(block, 0, BLOCK_BYTES);
-				else
-					signalled = true;
+				DWORD chunk = (avail < FEED_CHUNK) ? avail : FEED_CHUNK;
+
+				u32 got = fifo.read(scratch, chunk);
+				if (got > 0)
+					drainedSome = true;
+				if (got < chunk)
+					memset(scratch + got, 0, chunk - got);   // pad real shortfall only
 
 				void *p1 = nullptr, *p2 = nullptr;
 				DWORD s1 = 0, s2 = 0;
-				if (SUCCEEDED(streamBuf->Lock(dsWritePos, BLOCK_BYTES,
-						&p1, &s1, &p2, &s2, 0)))
-				{
-					if (p1 && s1) memcpy(p1, block, s1);
-					if (p2 && s2) memcpy(p2, block + s1, s2);
-					streamBuf->Unlock(p1, s1, p2, s2);
-					dsWritePos = (dsWritePos + BLOCK_BYTES) % DS_BUF_BYTES;
-					avail -= BLOCK_BYTES;
-				}
-				else
-				{
+				if (FAILED(streamBuf->Lock(dsWritePos, chunk, &p1, &s1, &p2, &s2, 0)))
 					break;
-				}
+				if (p1 && s1) memcpy(p1, scratch, s1);
+				if (p2 && s2) memcpy(p2, scratch + s1, s2);
+				streamBuf->Unlock(p1, s1, p2, s2);
+
+				dsWritePos = (dsWritePos + chunk) % DS_BUF_BYTES;
+				avail -= chunk;
 			}
 
-			// Let a blocked push() know the ring drained a bit.
-			if (signalled && pushWait)
-				SetEvent(pushWait);
+			if (drainedSome && pushWait)
+				SetEvent(pushWait);   // wake a blocked push()
+
+			// DRC: every ~32 ms, nudge the play rate toward what keeps the FIFO
+			// half full. FIFO draining (emu slow) -> slow playback; filling (emu
+			// fast) -> speed up. Smoothed + clamped so pitch glides, never jumps.
+			if (++drcTick >= 8 && fifoCapBytes > 0)
+			{
+				drcTick = 0;
+				double fillFrac = (double)fifo.readable() / (double)fifoCapBytes; // 0..1
+				double ratio    = 1.0 + DRC_GAIN * (fillFrac - 0.5) * 2.0;
+				if (ratio < DRC_MIN_RATIO) ratio = DRC_MIN_RATIO;
+				if (ratio > DRC_MAX_RATIO) ratio = DRC_MAX_RATIO;
+				double target = (double)AUDIO_SAMPLE_RATE * ratio;
+				drcFreq += (target - drcFreq) * DRC_SMOOTH;
+				streamBuf->SetFrequency((DWORD)(drcFreq + 0.5));
+			}
 
 			Sleep(4);
 		}
@@ -168,18 +283,22 @@ public:
 			streamBuf->Unlock(p1, s1, p2, s2);
 		}
 
-		// Ring buffer: follow the desktop backend's sizing (AudioBufferSize
-		// frames * FRAME_BYTES), but never smaller than the hardware buffer so
-		// the feeder always has room to work with.
-		u32 ringBytes = (u32)config::AudioBufferSize * FRAME_BYTES;
-		if (ringBytes < DS_BUF_BYTES * 2)
-			ringBytes = DS_BUF_BYTES * 2;
-		ringBuffer.setCapacity(ringBytes);
+		// Staging FIFO. DRC parks this near half-full as the elastic cushion that
+		// rides out fault-storm dips, so size it generously: ~3x the hardware
+		// buffer (target backlog ~140 ms) means a ~120 ms JIT spike drains the
+		// cushion without fully emptying it.
+		u32 fifoBytes = (u32)config::AudioBufferSize * FRAME_BYTES;
+		if (fifoBytes < DS_BUF_BYTES * 3)
+			fifoBytes = DS_BUF_BYTES * 3;
+		fifo.init(fifoBytes);
+		fifoCapBytes = fifoBytes;
 
 		dsWritePos = 0;
+		drcFreq    = (double)AUDIO_SAMPLE_RATE;
+		drcTick    = 0;
 		pushWait = CreateEvent(NULL, FALSE, FALSE, NULL);   // auto-reset
 
-		// Spin up the feeder before play so the cursor never outruns us.
+		// Feeder up before play so the cursor never outruns us.
 		feederRunning = true;
 		feederThread = CreateThread(NULL, 0, feederTrampoline, this, 0, NULL);
 		if (feederThread == nullptr)
@@ -198,17 +317,18 @@ public:
 			return false;
 		}
 
-		INFO_LOG(AUDIO, "Xbox DirectSound playback started (%lu Hz, %lu-byte ring)",
-			(unsigned long)AUDIO_SAMPLE_RATE, (unsigned long)ringBytes);
+		INFO_LOG(AUDIO, "Xbox DirectSound started (%lu Hz, %lu-byte hw buf, %lu-byte fifo)",
+			(unsigned long)AUDIO_SAMPLE_RATE, (unsigned long)DS_BUF_BYTES, (unsigned long)fifoBytes);
 		return true;
 	}
 
 	u32 push(const void *frame, u32 frames, bool wait) override
 	{
 		const u32 bytes = frames * FRAME_BYTES;
-		// Block until the feeder makes room (LimitFPS path). Time out so a
-		// stalled feeder can never deadlock the emulator.
-		while (!ringBuffer.write((const u8 *)frame, bytes) && wait)
+		// Block until the feeder frees space (LimitFPS path -> this is the frame
+		// limiter). Time out so a stalled feeder can never deadlock the emulator;
+		// if not waiting, drop the overflow rather than stall the AICA.
+		while (!fifo.write((const u8 *)frame, bytes) && wait)
 		{
 			if (pushWait)
 				WaitForSingleObject(pushWait, 100);
@@ -243,11 +363,10 @@ public:
 			CloseHandle(pushWait);
 			pushWait = nullptr;
 		}
-		INFO_LOG(AUDIO, "Xbox DirectSound playback stopped");
+		INFO_LOG(AUDIO, "Xbox DirectSound stopped");
 	}
 };
 
-// Registered with AudioBackend at static-init time (ctor calls
-// registerAudioBackend). Slug "directsound" sorts before "null", so the
-// "auto" backend selection picks it over the null driver automatically.
+// Registered with AudioBackend at static-init time (ctor -> registerAudioBackend).
+// Slug "directsound" sorts before "null", so "auto" selection picks it.
 static XboxDirectSoundBackend xboxDirectSoundBackend;

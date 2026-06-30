@@ -32,6 +32,35 @@ protected:
 	BaseXbyakRec(Sh4Context& sh4ctx, Sh4CodeBuffer& codeBuffer, u8 *code_ptr)
 	: Xbyak::CodeGenerator(codeBuffer.getFreeSpace(), code_ptr), sh4ctx(sh4ctx), codeBuffer(codeBuffer) { }
 
+	// --- Pentium III (original Xbox) SSE1-only safe FP register moves --------
+	// `movd xmm,r32` / `movd r32,xmm` (66 0F 6E/7E) are SSE2: they #UD on the
+	// Xbox's Coppermine P3 (which has SSE1 / XMM regs but not SSE2) even though
+	// they run fine under xemu (modern host). Bounce the 32 bits through a
+	// scratch dword with movss (SSE1). `if constexpr (ArchX64)` keeps the native
+	// movd on 64-bit builds (the scratch path isn't even instantiated there).
+	// Safe as a shared scratch because the SH-4 recompiler runs single-threaded
+	// and each emitted pair is straight-line generated code (no interleaving).
+	static inline u32 sse1Scratch = 0;
+
+	void sse1movd(const Xbyak::Xmm& dst, const Xbyak::Reg32& src)   // xmm <- r32
+	{
+		if constexpr (ArchX64)
+			movd(dst, src);
+		else {
+			mov(dword[&sse1Scratch], src);
+			movss(dst, dword[&sse1Scratch]);
+		}
+	}
+	void sse1movd(const Xbyak::Reg32& dst, const Xbyak::Xmm& src)   // r32 <- xmm
+	{
+		if constexpr (ArchX64)
+			movd(dst, src);
+		else {
+			movss(dword[&sse1Scratch], src);
+			mov(dst, dword[&sse1Scratch]);
+		}
+	}
+
 	using BinaryOp = void (BaseXbyakRec::*)(const Xbyak::Operand&, const Xbyak::Operand&);
 	using BinaryFOp = void (BaseXbyakRec::*)(const Xbyak::Xmm&, const Xbyak::Operand&);
 
@@ -92,7 +121,7 @@ protected:
 		if (op.rs2.is_imm())
 		{
 			mov(eax, op.rs2._imm);
-			movd(xmm0, eax);
+			sse1movd(xmm0, eax);
 			(this->*natop)(rd, xmm0);
 		}
 		else
@@ -492,14 +521,14 @@ protected:
 			break;
 
 		case shop_fabs:
-			movd(eax, mapXRegister(op.rs1));
+			sse1movd(eax, mapXRegister(op.rs1));
 			and_(eax, 0x7FFFFFFF);
-			movd(mapXRegister(op.rd), eax);
+			sse1movd(mapXRegister(op.rd), eax);
 			break;
 		case shop_fneg:
-			movd(eax, mapXRegister(op.rs1));
+			sse1movd(eax, mapXRegister(op.rs1));
 			xor_(eax, 0x80000000);
-			movd(mapXRegister(op.rd), eax);
+			sse1movd(mapXRegister(op.rd), eax);
 			break;
 
 		case shop_fsqrt:
@@ -525,7 +554,7 @@ protected:
 				if (op.rs1.is_imm()) // FIXME mapXRegister(op.rs1) would have failed
 				{
 					mov(eax, op.rs1._imm);
-					movd(rd, eax);
+					sse1movd(rd, eax);
 				}
 				else if (rd != rs1)
 				{
@@ -620,7 +649,7 @@ protected:
 		        cmp(rd, 0x80000000);	// indefinite integer
 		        jne(done, T_SHORT);
 		        xor_(eax, eax);
-		        pxor(xmm0, xmm0);
+		        xorps(xmm0, xmm0);	// SSE1 (pxor is SSE2; #UD on Xbox P3)
 		        ucomiss(mapXRegister(op.rs1), xmm0);
 		        setb(al);
 		        add(eax, 0x7fffffff);
@@ -649,7 +678,7 @@ protected:
 			else
 			{
 				mov(eax, param._imm);
-				movd((const Xbyak::Xmm &)reg, eax);
+				sse1movd((const Xbyak::Xmm &)reg, eax);
 			}
 		}
 		else if (param.is_reg())
@@ -660,7 +689,7 @@ protected:
 				{
 					Xbyak::Xmm sreg = mapXRegister(param, 0);
 					if (!reg.isXMM())
-						movd(reg.cvt32(), sreg);
+						sse1movd(reg.cvt32(), sreg);
 					else if (reg != sreg)
 						movss((const Xbyak::Xmm &)reg, sreg);
 #ifndef XBYAK32
@@ -694,7 +723,7 @@ protected:
 			{
 				Xbyak::Reg32 sreg = mapRegister(param);
 				if (reg.isXMM())
-					movd((const Xbyak::Xmm &)reg, sreg);
+					sse1movd((const Xbyak::Xmm &)reg, sreg);
 				else if (reg != sreg)
 					mov(reg.cvt32(), sreg);
 			}
@@ -734,13 +763,13 @@ protected:
 			if (!reg.isXMM())
 				mov(sreg, reg.cvt32());
 			else if (reg != sreg)
-				movd(sreg, (const Xbyak::Xmm &)reg);
+				sse1movd(sreg, (const Xbyak::Xmm &)reg);
 		}
 		else if (isAllocf(param))
 		{
 			Xbyak::Xmm sreg = mapXRegister(param, 0);
 			if (!reg.isXMM())
-				movd(sreg, reg.cvt32());
+				sse1movd(sreg, reg.cvt32());
 			else if (reg != sreg)
 				movss(sreg, (const Xbyak::Xmm &)reg);
 #ifndef XBYAK32

@@ -645,7 +645,7 @@ bool X86Compiler::genReadMemImmediate(const shil_opcode& op, RuntimeBlockInfo* b
 			if (regalloc.IsAllocg(op.rd))
 				mov(regalloc.MapRegister(op.rd), dword[ptr]);
 			else if (regalloc.IsAllocf(op.rd))
-				movd(regalloc.MapXRegister(op.rd), dword[ptr]);
+				movss(regalloc.MapXRegister(op.rd), dword[ptr]);	// SSE1 (movd xmm,m32 is SSE2)
 			else
 			{
 				mov(eax, dword[ptr]);
@@ -656,13 +656,13 @@ bool X86Compiler::genReadMemImmediate(const shil_opcode& op, RuntimeBlockInfo* b
 		case 8:
 			if (op.rd.count() == 2 && regalloc.IsAllocf(op.rd))
 			{
-				movd(regalloc.MapXRegister(op.rd, 0), dword[ptr]);
-				movd(regalloc.MapXRegister(op.rd, 1), dword[(u32 *)ptr + 1]);
+				movss(regalloc.MapXRegister(op.rd, 0), dword[ptr]);
+				movss(regalloc.MapXRegister(op.rd, 1), dword[(u32 *)ptr + 1]);
 			}
 			else
 			{
-				movq(xmm0, qword[ptr]);
-				movq(qword[op.rd.reg_ptr(sh4ctx)], xmm0);
+				movlps(xmm0, qword[ptr]);	// SSE1 64-bit move (movq xmm is SSE2)
+				movlps(qword[op.rd.reg_ptr(sh4ctx)], xmm0);
 			}
 			break;
 
@@ -770,7 +770,7 @@ bool X86Compiler::genWriteMemImmediate(const shil_opcode& op, RuntimeBlockInfo* 
 			if (regalloc.IsAllocg(op.rs2))
 				mov(dword[ptr], regalloc.MapRegister(op.rs2));
 			else if (regalloc.IsAllocf(op.rs2))
-				movd(dword[ptr], regalloc.MapXRegister(op.rs2));
+				movss(dword[ptr], regalloc.MapXRegister(op.rs2));	// SSE1 (movd m32,xmm is SSE2)
 			else if (op.rs2.is_imm())
 				mov(dword[ptr], op.rs2.imm_value());
 			else
@@ -783,13 +783,13 @@ bool X86Compiler::genWriteMemImmediate(const shil_opcode& op, RuntimeBlockInfo* 
 		case 8:
 			if (op.rs2.count() == 2 && regalloc.IsAllocf(op.rs2))
 			{
-				movd(dword[ptr], regalloc.MapXRegister(op.rs2, 0));
-				movd(dword[(u32 *)ptr + 1], regalloc.MapXRegister(op.rs2, 1));
+				movss(dword[ptr], regalloc.MapXRegister(op.rs2, 0));
+				movss(dword[(u32 *)ptr + 1], regalloc.MapXRegister(op.rs2, 1));
 			}
 			else
 			{
-				movq(xmm0, qword[op.rs2.reg_ptr(sh4ctx)]);
-				movq(qword[ptr], xmm0);
+				movlps(xmm0, qword[op.rs2.reg_ptr(sh4ctx)]);	// SSE1 64-bit move
+				movlps(qword[ptr], xmm0);
 			}
 			break;
 

@@ -166,7 +166,7 @@ void X86Compiler::genMemHandlers()
 					else
 					{
 						if (size == MemSize::F32)
-							movd(edx, xmm0);
+							sse1movd(edx, xmm0);	// SSE1-safe (movd r32,xmm is SSE2)
 						jmp((const void *)addrspace::write32);	// tail call
 						continue;
 					}
@@ -198,15 +198,15 @@ void X86Compiler::genMemHandlers()
 							// 16-byte alignment
 							alignStack(-12);
 							call((const void *)addrspace::read32);
-							movd(xmm0, eax);
+							sse1movd(xmm0, eax);	// SSE1-safe (movd xmm,r32 is SSE2)
 							alignStack(12);
 							break;
 						case MemSize::F64:
 							// 16-byte alignment
 							alignStack(-12);
 							call((const void *)addrspace::read64);
-							movd(xmm0, eax);
-							movd(xmm1, edx);
+							sse1movd(xmm0, eax);
+							sse1movd(xmm1, edx);
 							alignStack(12);
 							break;
 						default:
@@ -226,7 +226,7 @@ void X86Compiler::genMemHandlers()
 							jmp((const void *)addrspace::write32);	// tail call
 							continue;
 						case MemSize::F32:
-							movd(edx, xmm0);
+							sse1movd(edx, xmm0);	// SSE1-safe (movd r32,xmm is SSE2)
 							jmp((const void *)addrspace::write32);	// tail call
 							continue;
 						case MemSize::F64:
@@ -346,8 +346,8 @@ void X86Compiler::genOpcode(RuntimeBlockInfo* block, bool optimise, shil_opcode&
 		movss(regalloc.MapXRegister(op.rd, 1), regalloc.MapXRegister(op.rs1, 1));
 #else
 		verify(!regalloc.IsAllocAny(op.rd));
-		movq(xmm0, qword[op.rs1.reg_ptr(sh4ctx)]);
-		movq(qword[op.rd.reg_ptr(sh4ctx)], xmm0);
+		movlps(xmm0, qword[op.rs1.reg_ptr(sh4ctx)]);	// SSE1 64-bit move (movq xmm is SSE2)
+		movlps(qword[op.rd.reg_ptr(sh4ctx)], xmm0);
 #endif
 		break;
 
@@ -404,8 +404,8 @@ void X86Compiler::genOpcode(RuntimeBlockInfo* block, bool optimise, shil_opcode&
 			{
 				if (op.rd.count() == 2 && regalloc.IsAllocf(op.rd))
 				{
-					mov(regalloc.MapXRegister(op.rd, 0), xmm0);
-					mov(regalloc.MapXRegister(op.rd, 1), xmm1);
+					movss(regalloc.MapXRegister(op.rd, 0), xmm0);	// SSE1 FP-reg copy
+					movss(regalloc.MapXRegister(op.rd, 1), xmm1);
 				}
 				else
 				{
@@ -459,13 +459,13 @@ void X86Compiler::genOpcode(RuntimeBlockInfo* block, bool optimise, shil_opcode&
 			else {
 				if (op.rs2.count() == 2 && regalloc.IsAllocf(op.rs2))
 				{
-					mov(xmm0, regalloc.MapXRegister(op.rs2, 0));
-					mov(xmm1, regalloc.MapXRegister(op.rs2, 1));
+					movss(xmm0, regalloc.MapXRegister(op.rs2, 0));	// SSE1 FP-reg copy
+					movss(xmm1, regalloc.MapXRegister(op.rs2, 1));
 				}
 				else
 				{
-					movd(xmm0, dword[op.rs2.reg_ptr(sh4ctx)]);
-					movd(xmm1, dword[op.rs2.reg_ptr(sh4ctx) + 1]);
+					movss(xmm0, dword[op.rs2.reg_ptr(sh4ctx)]);	// SSE1 (movd xmm,m32 is SSE2)
+					movss(xmm1, dword[op.rs2.reg_ptr(sh4ctx) + 1]);
 				}
 			}
 			const u8 *start = getCurr();

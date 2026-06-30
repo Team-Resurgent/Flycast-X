@@ -127,6 +127,8 @@ if not exist "$(OutDir)XISO" mkdir "$(OutDir)XISO"
     <ClCompile Include="xbox_fault_handler.cpp" />
     <ClCompile Include="xbox_eh_shim.cpp" />
     <ClCompile Include="xbox_input.cpp" />
+    <!-- hardware audio: native Xbox DirectSound backend (replaces null driver) -->
+    <ClCompile Include="xbox_audio_directsound.cpp" />
     <!-- root -->
     <ClCompile Include="$(FLY)\core\stdclass.cpp" />
     <ClCompile Include="$(FLY)\core\emulator.cpp" />

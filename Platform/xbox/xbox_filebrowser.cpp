@@ -191,6 +191,12 @@ static int  g_sel = 0;
 static int  g_scroll = 0;
 static char g_result[300];
 
+// CPU mode chosen in the browser (toggled with X). main_xbox reads this and
+// sets config::DynarecEnabled. JIT = fast (most games); INTERPRETER = ~5-10x
+// slower but boots the Shinobi-class games the dynarec currently wedges on.
+static bool g_useDynarec = true;
+extern "C" bool xbox_UseDynarec() { return g_useDynarec; }
+
 static bool isDiscImage(const char* name)
 {
 	const char* dot = strrchr(name, '.');
@@ -345,6 +351,9 @@ static void drawFrame()
 	// Header.
 	rect(0, 0, 640, 34, 0xFF1E2A66);
 	drawStr(10, 8, "FLYCAST  -  SELECT GAME", 0xFFFFFF00, 2.0f, 0);
+	// CPU mode badge (top-right): green JIT / orange INTERPRETER.
+	drawStr(440, 10, g_useDynarec ? "CPU: JIT" : "CPU: INTERP",
+		g_useDynarec ? 0xFF60FF60 : 0xFFFFA040, 1.5f, 0);
 	// Current path (small).
 	drawStr(10, 40, g_cwd[0] ? g_cwd : "DRIVES", 0xFF80C8FF, 1.0f, 70);
 
@@ -375,7 +384,7 @@ static void drawFrame()
 
 	// Footer.
 	rect(0, 446, 640, 34, 0xFF1E2A66);
-	drawStr(10, 454, "A  SELECT      B  BACK      DPAD  MOVE", 0xFFB0B0B0, 1.5f, 0);
+	drawStr(10, 454, "A SELECT   B BACK   DPAD MOVE   X TOGGLE CPU", 0xFFB0B0B0, 1.5f, 0);
 
 	flush();
 	d->EndScene();
@@ -394,7 +403,7 @@ extern "C" const char* xbox_RunFileBrowser()
 	rebuild();
 
 	WORD prevBtns = 0;
-	BYTE prevA = 0, prevB = 0;
+	BYTE prevA = 0, prevB = 0, prevX = 0;
 
 	for (;;)
 	{
@@ -403,15 +412,18 @@ extern "C" const char* xbox_RunFileBrowser()
 		WORD btns = have ? st.Gamepad.wButtons : 0;
 		BYTE aBtn = have ? st.Gamepad.bAnalogButtons[XINPUT_GAMEPAD_A] : 0;
 		BYTE bBtn = have ? st.Gamepad.bAnalogButtons[XINPUT_GAMEPAD_B] : 0;
+		BYTE xBtn = have ? st.Gamepad.bAnalogButtons[XINPUT_GAMEPAD_X] : 0;
 
 		bool up    = (btns & XINPUT_GAMEPAD_DPAD_UP)   && !(prevBtns & XINPUT_GAMEPAD_DPAD_UP);
 		bool down  = (btns & XINPUT_GAMEPAD_DPAD_DOWN) && !(prevBtns & XINPUT_GAMEPAD_DPAD_DOWN);
 		bool aHit  = (aBtn > 30) && !(prevA > 30);
 		bool bHit  = (bBtn > 30) && !(prevB > 30);
+		bool xHit  = (xBtn > 30) && !(prevX > 30);
 
 		int count = (int)g_entries.size();
 		if (up && count > 0)   g_sel = (g_sel - 1 + count) % count;
 		if (down && count > 0) g_sel = (g_sel + 1) % count;
+		if (xHit)              g_useDynarec = !g_useDynarec;   // toggle JIT/interpreter
 		if (bHit)              goUp();
 		if (aHit && activate())
 			break;             // selection made -> g_result is set
@@ -421,6 +433,7 @@ extern "C" const char* xbox_RunFileBrowser()
 		prevBtns = btns;
 		prevA = aBtn;
 		prevB = bBtn;
+		prevX = xBtn;
 		Sleep(16);
 	}
 

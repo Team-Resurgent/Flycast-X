@@ -64,10 +64,19 @@ static void setupLogging()
     LogManager* lm = LogManager::GetInstance();
     if (!lm) { DBG("FLYCAST: LogManager is null\n"); return; }
     DBG("FLYCAST: SetLogLevel...\n");
-    // LWARNING, not LDEBUG: every log line is emitted via OutputDebugStringA,
-    // which is SERIAL debug output and very slow on xemu/hardware. At LDEBUG the
-    // core spams the loop and throttles emulation. Warnings/errors only.
-    lm->SetLogLevel(LogTypes::LWARNING);
+    // INFO so the boot/GD-ROM path is visible (debugging MvC2's boot hang). Logs
+    // go via OutputDebugStringA (serial, slow), so SILENCE the high-frequency
+    // categories -- keep only BOOT/COMMON/GDROM/REIOS/HOLLY/MEMORY/FLASHROM/
+    // NAOMI/VMEM, which is exactly the boot+disc activity we want to trace.
+    lm->SetLogLevel(LogTypes::LINFO);
+    static const LogTypes::LOG_TYPE kQuiet[] = {
+        LogTypes::AICA, LogTypes::AICA_ARM, LogTypes::AUDIO, LogTypes::DYNAREC,
+        LogTypes::INPUT, LogTypes::INTERPRETER, LogTypes::JVS, LogTypes::MAPLE,
+        LogTypes::PVR, LogTypes::RENDERER, LogTypes::SH4, LogTypes::PROFILER,
+        LogTypes::MODEM, LogTypes::NETWORK, LogTypes::SAVESTATE,
+    };
+    for (size_t i = 0; i < sizeof(kQuiet) / sizeof(kQuiet[0]); i++)
+        lm->SetEnable(kQuiet[i], false);
     DBG("FLYCAST: EnableListener(console)...\n");
     lm->EnableListener(LogListener::CONSOLE_LISTENER, true);
     DBG("FLYCAST: logging ready\n");
@@ -170,6 +179,134 @@ void xbox_PollInput();
 // Pre-boot file browser (xbox_filebrowser.cpp). Returns the chosen disc-image
 // path, or "" to boot the Dreamcast BIOS/dashboard.
 extern "C" const char* xbox_RunFileBrowser();
+// CPU mode picked in the browser (X toggle): true = dynarec/JIT, false = interpreter.
+extern "C" bool xbox_UseDynarec();
+
+// --- Watchdog -------------------------------------------------------------
+// Catches a render()/JIT hang (main loop fully frozen, e.g. MvC2 halting at
+// 8c1742c0). A separate thread watches a beat counter and, if it stops, dumps
+// the SH-4 pc + R0..R15 + PR, then the ASCII of the RAM that R2/R3 point at --
+// MvC2 halts in an error loop printing a "---" banner, so this should reveal
+// the actual error message text and tell us WHY it bailed.
+namespace addrspace { extern u8* ram_base; }   // fastmem base (read guest RAM)
+
+// Xbox debug-monitor thread API (xbdm.lib) -- lets the watchdog read the FROZEN
+// emu thread's HOST x86 EIP, to see where the dynarec is actually stuck (a JIT
+// block vs the block compiler vs a C++ helper).
+extern "C" {
+    long __stdcall DmSuspendThread(unsigned long dwThreadId);
+    long __stdcall DmResumeThread(unsigned long dwThreadId);
+    long __stdcall DmGetThreadContext(unsigned long dwThreadId, CONTEXT* pCtx);
+}
+static unsigned long g_emuTid = 0;   // emu (main) thread id, set before the loop
+extern "C" volatile unsigned g_uintc_calls;   // scheduler-tick counter (sh4_interpreter.cpp)
+
+// Dump `count` SH-4 instruction words (u16) at `vaddr` as hex, to decode the loop.
+static void dumpGuestHex16(const char* tag, u32 vaddr, int count)
+{
+    OutputDebugStringA(tag);
+    if (addrspace::ram_base == nullptr) { OutputDebugStringA("(no ram_base)\n"); return; }
+    const u16* p = (const u16*)(addrspace::ram_base + 0x0C000000u + (vaddr & 0x00FFFFFFu));
+    char line[96]; int n = 0;
+    for (int i = 0; i < count; i++)
+    {
+        n += wsprintfA(line + n, "%04x ", p[i]);
+        if ((i & 7) == 7) { line[n++] = '\n'; line[n] = 0; OutputDebugStringA(line); n = 0; }
+    }
+    if (n) { line[n++] = '\n'; line[n] = 0; OutputDebugStringA(line); }
+}
+
+// Dump `bytes` of guest RAM at virtual addr `vaddr` as ASCII. RAM only.
+static void dumpGuestAscii(const char* tag, u32 vaddr, int bytes)
+{
+    OutputDebugStringA(tag);
+    if (addrspace::ram_base == nullptr) { OutputDebugStringA("(no ram_base)\n"); return; }
+    const u8* p = addrspace::ram_base + 0x0C000000u + (vaddr & 0x00FFFFFFu);
+    char line[40];
+    for (int row = 0; row * 16 < bytes; row++)
+    {
+        int n = 0;
+        for (int c = 0; c < 16; c++)
+        {
+            u8 ch = p[row * 16 + c];
+            line[n++] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+        }
+        line[n++] = '\n'; line[n] = 0;
+        OutputDebugStringA(line);
+    }
+}
+
+static volatile unsigned g_mainLoopBeat = 0;
+static DWORD WINAPI watchdogThread(LPVOID)
+{
+    unsigned last = 0;
+    int stalls = 0;
+    bool dumped = false;
+    for (;;)
+    {
+        Sleep(1000);
+        unsigned now = g_mainLoopBeat;
+        if (now != last) { last = now; stalls = 0; dumped = false; continue; }
+        if (++stalls >= 4 && !dumped)   // ~4 s with no main-loop progress
+        {
+            dumped = true;
+            OutputDebugStringA("*** WATCHDOG: main loop STALLED (render hang) ***\n");
+            char b[96];
+
+            // Is the scheduler tick still running during the hang? Sample, wait,
+            // sample again. delta==0 => the dynarec is spinning in a JIT block that
+            // never reaches intc_sched (block prologue); delta>0 => it IS reaching
+            // the scheduler but not exiting.
+            unsigned u0 = g_uintc_calls;
+            unsigned rw0 = g_fault_rewrite, smc0 = g_fault_ramsmc, fp0 = g_fault_fpcb;
+            Sleep(300);
+            unsigned u1 = g_uintc_calls;
+            unsigned rw1 = g_fault_rewrite, smc1 = g_fault_ramsmc, fp1 = g_fault_fpcb;
+            wsprintfA(b, "UpdateSystem_INTC delta=%u (sched %s)\n",
+                u1 - u0, (u1 == u0) ? "FROZEN -> block bypasses prologue" : "ticking");
+            OutputDebugStringA(b);
+            // Faults still firing DURING the freeze? A rewrite/SMC storm here means
+            // the block is being recompiled+refaulted in a loop (patch never sticks).
+            wsprintfA(b, "FAULTS in 300ms freeze: rw=%u smc=%u fpcb=%u\n",
+                rw1 - rw0, smc1 - smc0, fp1 - fp0);
+            OutputDebugStringA(b);
+
+            // HOST x86 state of the frozen emu thread. Suspend/read/resume FIRST,
+            // then print (don't print while it's suspended -> serial-lock deadlock).
+            if (g_emuTid)
+            {
+                CONTEXT hc;
+                memset(&hc, 0, sizeof(hc));
+                hc.ContextFlags = CONTEXT_CONTROL;
+                DmSuspendThread(g_emuTid);
+                long hr = DmGetThreadContext(g_emuTid, &hc);
+                DmResumeThread(g_emuTid);
+                // &watchdogThread is a static-image anchor: EIP near it => stuck in
+                // C++ code; EIP far away => stuck in a JIT block (dynamic cache).
+                wsprintfA(b, "HOST EIP=%08x ESP=%08x (img~%08x hr=%08x)\n",
+                    (unsigned)hc.Eip, (unsigned)hc.Esp,
+                    (unsigned)(uintptr_t)&watchdogThread, (unsigned)hr);
+                OutputDebugStringA(b);
+            }
+            wsprintfA(b, "pc=%08x pr=%08x\n", (unsigned)Sh4cntx.pc, (unsigned)Sh4cntx.pr);
+            OutputDebugStringA(b);
+            for (int i = 0; i < 16; i += 4)
+            {
+                wsprintfA(b, "R%d=%08x R%d=%08x R%d=%08x R%d=%08x\n",
+                    i,   (unsigned)Sh4cntx.r[i],   i+1, (unsigned)Sh4cntx.r[i+1],
+                    i+2, (unsigned)Sh4cntx.r[i+2], i+3, (unsigned)Sh4cntx.r[i+3]);
+                OutputDebugStringA(b);
+            }
+            // Interrupt state + the loop instructions: is it waiting on an IRQ
+            // (jmp-to-self) or polling a flag (mov.l @Rn / tst / bt)?
+            wsprintfA(b, "int_pend=%08x CpuRunning=%08x\n",
+                (unsigned)Sh4cntx.interrupt_pend, (unsigned)Sh4cntx.CpuRunning);
+            OutputDebugStringA(b);
+            dumpGuestHex16("CODE @pc:\n", (u32)Sh4cntx.pc, 16);
+            dumpGuestAscii("MEM @R2:\n", (u32)Sh4cntx.r[2], 128);
+        }
+    }
+}
 
 static bool runEmu()
 {
@@ -218,6 +355,14 @@ static bool runEmu()
                                             : "FLYCAST: ThreadedRendering=FALSE (good)\n");
         // (AICA DSP left ENABLED: the perf experiment showed disabling it did not
         // move the frame time -- audio is not the bottleneck, the SH-4 is.)
+
+        // CPU mode chosen in the file browser (X toggles JIT/interpreter).
+        // getSh4Executor() reads config::DynarecEnabled at runtime, so this takes
+        // effect for emu.start(). JIT for normal games; interpreter (slow) boots
+        // the Shinobi-class games the dynarec still wedges on.
+        config::DynarecEnabled.override(xbox_UseDynarec());
+        DBG((bool)config::DynarecEnabled ? "FLYCAST: Dynarec=TRUE (JIT)\n"
+                                         : "FLYCAST: Dynarec=FALSE (INTERPRETER)\n");
         DBG("FLYCAST: emu.start()\n");
         emu.start();
         DBG("FLYCAST: emu.start() RETURNED; entering render loop\n");
@@ -239,10 +384,49 @@ static bool runEmu()
         // ~100% == locked to 1x (audio rate-correct); >100% == running fast.
         LARGE_INTEGER wallBase; QueryPerformanceCounter(&wallBase);
         u64 emuClkBase = sh4_sched_now64();
+        g_emuTid = GetCurrentThreadId();                        // for the watchdog's host-EIP read
+        CreateThread(NULL, 0, watchdogThread, NULL, 0, NULL);   // SH-4 hang detector
         for (;;)                       // run the BIOS forever; renderer presents each frame
         {
+            g_mainLoopBeat++;          // watchdog liveness tick
             os_DoEvents();
             xbox_PollInput();          // Xbox pad -> mapleInputState[]
+
+            // HEARTBEAT + WEDGE DETECT (boot-hang debug). Every 8 frames print the
+            // SH-4 pc. If the pc stays put for ~64 frames the game is spinning in a
+            // wait loop -- dump R0..R15 + PR once so we can see WHAT it polls: a
+            // register holding 0xA05Fxxxx = a HOLLY/GD-ROM/AICA hw register; a
+            // 0x8Cxxxxxx value = a RAM flag another component (ARM7/DMA) should set.
+            static unsigned s_hb = 0;
+            static unsigned s_lastHbPc = 0xFFFFFFFFu;
+            static int  s_stuck = 0;
+            static bool s_dumped = false;
+            unsigned curPc = (unsigned)Sh4cntx.pc;
+            if ((s_hb++ & 7) == 0)
+            {
+                char hb[80];
+                wsprintfA(hb, "HB %u pc=%08x\n", s_hb, curPc);
+                OutputDebugStringA(hb);
+                if (curPc == s_lastHbPc)
+                {
+                    if (++s_stuck >= 2 && !s_dumped)
+                    {
+                        s_dumped = true;
+                        OutputDebugStringA("*** SH4 WEDGED - register dump ***\n");
+                        for (int i = 0; i < 16; i += 4)
+                        {
+                            wsprintfA(hb, "R%d=%08x R%d=%08x R%d=%08x R%d=%08x\n",
+                                i,   (unsigned)Sh4cntx.r[i],   i+1, (unsigned)Sh4cntx.r[i+1],
+                                i+2, (unsigned)Sh4cntx.r[i+2], i+3, (unsigned)Sh4cntx.r[i+3]);
+                            OutputDebugStringA(hb);
+                        }
+                        wsprintfA(hb, "PR=%08x\n", (unsigned)Sh4cntx.pr);
+                        OutputDebugStringA(hb);
+                    }
+                }
+                else { s_stuck = 0; s_dumped = false; }
+                s_lastHbPc = curPc;
+            }
 
             // NO wall-clock frame limiter here: the audio backend is the single
             // pacing clock now. The AICA's push() blocks on the DirectSound FIFO

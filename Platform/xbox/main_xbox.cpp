@@ -89,6 +89,15 @@ static void DBGHEX(const char* tag, unsigned v)
 // print the faulting code+address (map via image = runtime + 0x3EF000).
 extern "C" int xbox_FastmemFault(struct _EXCEPTION_POINTERS* ep);
 extern "C" volatile unsigned g_fault_total;   // xbox_fault_handler.cpp
+// Per-category fault counters (xbox_fault_handler.cpp). Breaking the storm down
+// by kind tells us what to optimize: fpcb=JIT block-table demand paging,
+// rewrite=fastmem->slow MMIO patch sites, ramsmc=self-modifying-code unprotects,
+// vram=texture/framebuffer invalidations, unhandled=genuine (crash) faults.
+extern "C" volatile unsigned g_fault_fpcb;
+extern "C" volatile unsigned g_fault_rewrite;
+extern "C" volatile unsigned g_fault_ramsmc;
+extern "C" volatile unsigned g_fault_vram;
+extern "C" volatile unsigned g_fault_unhandled;
 
 static unsigned g_sehCode = 0, g_sehAddr = 0;
 static int sehFilter(struct _EXCEPTION_POINTERS* ep)
@@ -219,6 +228,8 @@ static bool runEmu()
         long long emuUsAcc = 0;
         unsigned frame = 0;
         unsigned faultBase = g_fault_total;
+        unsigned fpcbBase = g_fault_fpcb, rewriteBase = g_fault_rewrite;
+        unsigned smcBase = g_fault_ramsmc, vramBase = g_fault_vram, unhBase = g_fault_unhandled;
         // Window bases for measuring *actual* presented fps and realtime speed:
         // speed% = emulated time advanced / real wall time over the window.
         // ~100% == locked to 1x (audio rate-correct); >100% == running fast.
@@ -229,43 +240,16 @@ static bool runEmu()
             os_DoEvents();
             xbox_PollInput();          // Xbox pad -> mapleInputState[]
 
-            // --- REALTIME PACING ---------------------------------------------
-            // The render loop has no throttle of its own and audio-backpressure
-            // pacing alone is too loose under xemu's HLE DirectSound, so the
-            // emulator free-runs (often 80-100 fps) and stutters. We pace wall
-            // time to EMULATED time: measure how many SH-4 cycles this render()
-            // advanced and sleep until real time matches. SH4_MAIN_CLOCK cycles
-            // == 1 emulated second, so the DC runs at a true 1x -> the AICA
-            // emits 44.1 kHz of audio per wall-second, matching the DirectSound
-            // drain rate (kills the overflow/erratic-rate crackle), and video
-            // stops racing. Pacing on emulated time (not a fixed 60 fps) stays
-            // correct even when one render() spans several DC frames.
-            u64 emuCyclesStart = sh4_sched_now64();
+            // NO wall-clock frame limiter here: the audio backend is the single
+            // pacing clock now. The AICA's push() blocks on the DirectSound FIFO
+            // when it's full, so the emulator is paced to exactly the 44.1 kHz
+            // hardware drain rate -- one clock, zero drift, correct pitch. If the
+            // SH-4 can't sustain realtime the audio underruns (a clean dropout)
+            // rather than the old wall-clock limiter masking it.
             LARGE_INTEGER a; QueryPerformanceCounter(&a);
             emu.render();
             LARGE_INTEGER b; QueryPerformanceCounter(&b);
             emuUsAcc += (b.QuadPart - a.QuadPart) * 1000000 / qfreq.QuadPart;
-
-            // Wall ticks this render *should* have taken at 1x speed.
-            u64 emuCycles = sh4_sched_now64() - emuCyclesStart;
-            long long targetTicks =
-                (long long)((double)emuCycles * (double)qfreq.QuadPart / (double)SH4_MAIN_CLOCK);
-            // Clamp so a one-off huge step (reset / load hitch) can't freeze us.
-            long long maxTicks = qfreq.QuadPart / 10;   // 100 ms ceiling
-            if (targetTicks > maxTicks) targetTicks = maxTicks;
-            long long deadline = a.QuadPart + targetTicks;
-            for (;;)
-            {
-                LARGE_INTEGER now; QueryPerformanceCounter(&now);
-                long long remain = deadline - now.QuadPart;
-                if (remain <= 0)
-                    break;
-                long long remainMs = remain * 1000 / qfreq.QuadPart;
-                if (remainMs > 2)
-                    Sleep((DWORD)(remainMs - 1));   // give the tail back to the OS
-                // else busy-spin the last <2 ms for accuracy
-            }
-            // -----------------------------------------------------------------
 
             if (++frame % 60 == 0)
             {
@@ -275,6 +259,12 @@ static bool runEmu()
                 int rendMs   = (int)(renderUs / 60 / 1000);
                 unsigned faults = g_fault_total - faultBase;
                 faultBase = g_fault_total;
+                // Per-category deltas over this window (what kind of fault storm).
+                unsigned dFpcb = g_fault_fpcb - fpcbBase;       fpcbBase = g_fault_fpcb;
+                unsigned dRewr = g_fault_rewrite - rewriteBase; rewriteBase = g_fault_rewrite;
+                unsigned dSmc  = g_fault_ramsmc - smcBase;      smcBase = g_fault_ramsmc;
+                unsigned dVram = g_fault_vram - vramBase;       vramBase = g_fault_vram;
+                unsigned dUnh  = g_fault_unhandled - unhBase;   unhBase = g_fault_unhandled;
 
                 // Actual presented fps + realtime speed over this 60-frame window.
                 LARGE_INTEGER wnow; QueryPerformanceCounter(&wnow);
@@ -286,9 +276,9 @@ static bool runEmu()
                 emuClkBase = sh4_sched_now64();
 
                 char buf[256];
-                wsprintfA(buf, "FLYCAST PERF: %dms cap=%dfps | REAL %dfps speed=%d%% | faults=%u pc=%08x\n",
-                          totalMs, totalMs > 0 ? 1000 / totalMs : 0, realFps, speedPct, faults,
-                          (unsigned)Sh4cntx.pc);
+                wsprintfA(buf, "FLYCAST PERF: %dms REAL %dfps speed=%d%% | flt=%u fpcb=%u rw=%u smc=%u vram=%u bad=%u pc=%08x\n",
+                          totalMs, realFps, speedPct, faults,
+                          dFpcb, dRewr, dSmc, dVram, dUnh, (unsigned)Sh4cntx.pc);
                 OutputDebugStringA(buf);
                 emuUsAcc = 0;
             }

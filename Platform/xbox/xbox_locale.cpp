@@ -192,6 +192,25 @@ void __CLRCALL_PURE_OR_CDECL locale::_Locimp::_Locimp_ctor(_Locimp* p, const _Lo
     }
 }
 
+// ---- classic "C" numeric punctuation ----------------------------------------
+//  The stock numpunct<char> pulls grouping/decimal/thousands from _Locinfo ->
+//  localeconv(), which the Xbox has no working data for. A garbage (non-empty)
+//  grouping makes num_get fail the group-size check on EVERY valid integer
+//  (it extracts the value, then sets failbit), which breaks istringstream>>int
+//  -- e.g. gdi.cpp's track parser. Override the virtuals with fixed C-locale
+//  values so num_get sees grouping="" (no check) regardless of _Locinfo.
+class ClassicNumpunct : public numpunct<char>
+{
+public:
+    explicit ClassicNumpunct(size_t refs) : numpunct<char>(refs) {}
+protected:
+    char        do_decimal_point() const override { return '.'; }
+    char        do_thousands_sep() const override { return ','; }
+    string      do_grouping()      const override { return string(); }   // no grouping
+    string      do_truename()      const override { return "true"; }
+    string      do_falsename()     const override { return "false"; }
+};
+
 // ---- _Init / global locale: build the classic "C" locale once ---------------
 static locale::_Locimp* g_classic = nullptr;
 
@@ -199,11 +218,10 @@ locale::_Locimp* __CLRCALL_PURE_OR_CDECL locale::_Init(bool)
 {
     if (!g_classic) {
         _Locimp* imp = _Locimp::_New_Locimp(false);
-        _Locinfo li("C");
         // ::std:: qualify ctype/collate to dodge legacy global ::ctype/::collate.
         imp->_Addfac(new ::std::ctype<char>(reinterpret_cast<const ::std::ctype<char>::mask*>(classic_ctype_table()), false, 1), ::std::ctype<char>::id._Get_index());
         imp->_Addfac(new codecvt<char, char, mbstate_t>(1),                     codecvt<char, char, mbstate_t>::id._Get_index());
-        imp->_Addfac(new numpunct<char>(li, 1, true),                           numpunct<char>::id._Get_index());
+        imp->_Addfac(new ClassicNumpunct(1),                                    numpunct<char>::id._Get_index());
         imp->_Addfac(new num_get<char>(1),                                      num_get<char>::id._Get_index());
         imp->_Addfac(new num_put<char>(1),                                      num_put<char>::id._Get_index());
         imp->_Addfac(new ::std::collate<char>(1),                               ::std::collate<char>::id._Get_index());

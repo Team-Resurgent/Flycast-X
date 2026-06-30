@@ -183,15 +183,54 @@ extern "C" size_t __stdcall __std_find_last_of_trivial_pos_1(
 
 // ===========================================================================
 //  std::sto* (string -> integer) backends. Forward to RXDK's _strtoi64 family.
+//
+//  CRITICAL: the 4th param is an `int* _Perr` out-parameter, and num_get's
+//  do_get() passes the address of an UNINITIALIZED local `int _Errno`, then
+//  fails the read if `_Errno != 0`. If we don't write *_Perr, every integer
+//  istream extraction (>> int) gets a garbage _Errno -> spurious failbit, even
+//  though the value parsed fine. That broke ALL istringstream>>int on Xbox
+//  (e.g. gdi.cpp's track parser). So: set *_Perr to 0 on success, ERANGE on
+//  overflow, and clamp the narrowing for the 32-bit long/unsigned long types.
 // ===========================================================================
+#include <cerrno>
+#include <climits>
 extern "C" __int64          _strtoi64(const char*, char**, int);
 extern "C" unsigned __int64 _strtoui64(const char*, char**, int);
 
 extern "C" {
-long           __cdecl _Stolx  (const char* s, char** end, int base, int*) { return (long)_strtoi64(s, end, base); }
-unsigned long  __cdecl _Stoulx (const char* s, char** end, int base, int*) { return (unsigned long)_strtoui64(s, end, base); }
-long long      __cdecl _Stollx (const char* s, char** end, int base, int*) { return (long long)_strtoi64(s, end, base); }
-unsigned long long __cdecl _Stoullx(const char* s, char** end, int base, int*) { return (unsigned long long)_strtoui64(s, end, base); }
+long __cdecl _Stolx(const char* s, char** end, int base, int* perr)
+{
+    errno = 0;
+    __int64 v = _strtoi64(s, end, base);
+    int e = errno;
+    if (v > LONG_MAX)      { v = LONG_MAX; e = ERANGE; }
+    else if (v < LONG_MIN) { v = LONG_MIN; e = ERANGE; }
+    if (perr) *perr = e;
+    return (long)v;
+}
+unsigned long __cdecl _Stoulx(const char* s, char** end, int base, int* perr)
+{
+    errno = 0;
+    unsigned __int64 v = _strtoui64(s, end, base);
+    int e = errno;
+    if (v > ULONG_MAX) { v = ULONG_MAX; e = ERANGE; }
+    if (perr) *perr = e;
+    return (unsigned long)v;
+}
+long long __cdecl _Stollx(const char* s, char** end, int base, int* perr)
+{
+    errno = 0;
+    long long v = (long long)_strtoi64(s, end, base);
+    if (perr) *perr = errno;
+    return v;
+}
+unsigned long long __cdecl _Stoullx(const char* s, char** end, int base, int* perr)
+{
+    errno = 0;
+    unsigned long long v = (unsigned long long)_strtoui64(s, end, base);
+    if (perr) *perr = errno;
+    return v;
+}
 }
 
 // ===========================================================================

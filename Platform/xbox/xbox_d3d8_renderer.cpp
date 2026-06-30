@@ -6,6 +6,7 @@
 #include "hw/pvr/ta_structs.h"
 #include "hw/pvr/Renderer_if.h"
 #include "rend/TexCache.h"
+#include "rend/texconv.h"      // palette32_ram[] -- the converted DC palette
 #include <vector>
 #include <string>
 #include <cstdlib>
@@ -24,6 +25,10 @@ extern "C" void __stdcall OutputDebugStringA(const char*);
 #define RDBG(s) OutputDebugStringA(s)
 
 extern IDirect3DDevice8* g_xbox_d3d_dev;
+
+// Bumped whenever the DC palette RAM changes (Renderer::updatePalette fires).
+// Hardware palettes (g_pals) refresh their colours when they fall behind this.
+static u32 g_palGen = 1;
 
 // Perf probe: total microseconds spent inside our D3D8 Render()+Present() this
 // session. main_xbox.cpp samples the delta every 60 frames to split render cost
@@ -81,23 +86,111 @@ static const D3DBLEND k_dst[8] = {
 };
 
 // ---------------------------------------------------------------------------
+//  Hardware palette cache (for gpuPalette / P8 textures)
+//
+//  The DC reuses ONE index texture with different 256-entry palette windows
+//  (tcw.PalSelect) per draw. Instead of baking a separate RGBA texture per
+//  PalSelect (which churns texture memory on every palette change), we keep one
+//  native D3DPalette per window offset, shared across all paletted textures, and
+//  only refresh its colours (a 256-DWORD write) when DC palette RAM changes.
+//  PAL8 window = (PalSelect>>4)<<8 (256 entries); PAL4 = PalSelect<<4 (16 used).
+// ---------------------------------------------------------------------------
+struct XboxPal { u32 off; u32 gen; D3DPalette* pal; };
+static std::vector<XboxPal> g_pals;
+
+static D3DPalette* GetXboxPalette(u32 off)
+{
+    XboxPal* e = nullptr;
+    for (auto& p : g_pals) if (p.off == off) { e = &p; break; }
+    if (!e)
+    {
+        D3DPalette* pal = nullptr;
+        if (FAILED(g_xbox_d3d_dev->CreatePalette(D3DPALETTE_256, &pal)) || !pal)
+            return nullptr;
+        g_pals.push_back({ off, 0u, pal });
+        e = &g_pals.back();
+    }
+    if (e->gen != g_palGen)        // DC palette RAM changed -> refresh in place
+    {
+        D3DCOLOR* col = nullptr;
+        if (SUCCEEDED(e->pal->Lock(&col, 0)) && col)
+        {
+            for (int i = 0; i < 256; ++i)
+            {
+                // palette32_ram is RGBA (0xAABBGGRR, OpenGL RendererType); swap
+                // R<->B to D3D ARGB, exactly like cvtCol does for vertex colours.
+                u32 p = palette32_ram[(i + off) & 1023];
+                col[i] = (p & 0xFF00FF00u) | ((p & 0x000000FFu) << 16) | ((p >> 16) & 0xFFu);
+            }
+            e->pal->Unlock();
+        }
+        e->gen = g_palGen;
+    }
+    return e->pal;
+}
+
+// ---------------------------------------------------------------------------
 //  Texture cache
 //  NV2A mis-samples 16-bit swizzled formats — expand everything to A8R8G8B8
-//  then XGSwizzleRect so the GPU samples correctly.
+//  then XGSwizzleRect so the GPU samples correctly. Paletted textures stay P8.
 // ---------------------------------------------------------------------------
 class XboxTex final : public BaseTextureCacheData
 {
 public:
+    // For non-paletted textures this is an A8R8G8B8 texture; for gpuPalette
+    // (_8) textures it is a native P8 index texture (1 byte/pixel) whose colours
+    // come from a hardware palette bound per-draw -- see GetXboxPalette / applyPoly.
     IDirect3DTexture8* d3dtex = nullptr;
 
     XboxTex(TSP tsp={}, TCW tcw={}, int area=0) : BaseTextureCacheData(tsp, tcw, area) {}
-    XboxTex(XboxTex&& o) : BaseTextureCacheData(std::move(o)) { std::swap(d3dtex, o.d3dtex); }
+    XboxTex(XboxTex&& o) : BaseTextureCacheData(std::move(o))
+    {
+        std::swap(d3dtex, o.d3dtex);
+    }
 
     std::string GetId() override { return std::to_string((uintptr_t)d3dtex); }
+
+    // CreateTexture (lazily) + swizzle a finished A8R8G8B8 buffer into it.
+    void commitPx(const u32* px, int w, int h)
+    {
+        if (!d3dtex
+            && FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
+                          D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &d3dtex)))
+            return;
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
+        {
+            XGSwizzleRect((void*)px, w * 4, NULL, lr.pBits, w, h, NULL, 4);
+            d3dtex->UnlockRect(0);
+        }
+    }
 
     void UploadToGPU(int w, int h, const u8* src, bool, bool) override
     {
         const int n = w * h;
+
+        // Paletted (PAL4/PAL8) textures reach us as palette INDICES (_8 /
+        // gpuPalette). One index texture is reused with many palette windows
+        // (tcw.PalSelect) per draw -- that's how e.g. Mr.Driller gets several
+        // block colours from one sprite. Upload the indices ONCE as a native P8
+        // texture (4x smaller than RGBA, no per-PalSelect duplication); the DC
+        // palette is applied by the hardware palette bound in applyPoly. This is
+        // exactly what the NV2A's paletted-texture path is for.
+        if (tex_type == TextureType::_8)
+        {
+            if (!d3dtex
+                && FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
+                              D3DFMT_P8, D3DPOOL_MANAGED, &d3dtex)))
+                return;
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
+            {
+                XGSwizzleRect((void*)src, w, NULL, lr.pBits, w, h, NULL, 1); // 1 byte/px
+                d3dtex->UnlockRect(0);
+            }
+            return;
+        }
+
         u32* px = (u32*)malloc(n * 4);
         if (!px) return;
 
@@ -141,32 +234,12 @@ public:
             memcpy(px, src, n * 4);
             break;
 
-        case TextureType::_8:
-            for (int i = 0; i < n; ++i)
-                px[i] = (u32)src[i] << 24 | 0x00ffffffu;
-            break;
-
         default:
             free(px);
             return;
         }
 
-        if (!d3dtex)
-        {
-            if (FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
-                           D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &d3dtex)))
-            {
-                free(px);
-                return;
-            }
-        }
-
-        D3DLOCKED_RECT lr;
-        if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
-        {
-            XGSwizzleRect(px, w * 4, NULL, lr.pBits, w, h, NULL, 4);
-            d3dtex->UnlockRect(0);
-        }
+        commitPx(px, w, h);
         free(px);
     }
 
@@ -234,7 +307,11 @@ struct XboxD3D8Renderer final : Renderer
     BaseTextureCacheData* GetTexture(TSP tsp, TCW tcw, int area) override
     {
         XboxTex* t = tc.getTextureCacheData(tsp, tcw, area);
-        if (t->NeedsUpdate()) t->Update();
+        if (t->NeedsUpdate())
+            t->Update();
+        // gpuPalette colour staleness is handled in GetXboxPalette(): the shared
+        // hardware palette refreshes its entries when g_palGen advances. The P8
+        // index texture itself never needs re-uploading on a palette change.
         return t;
     }
 
@@ -242,35 +319,17 @@ struct XboxD3D8Renderer final : Renderer
     {
         rc = &ctx->rend;
 
-        // Pre-scan for unhandled TA param types (3 or 6) BEFORE calling ta_parse.
-        // ta_parse throws TAParserException on these, which propagates through a
-        // noexcept boundary and calls std::terminate (kills the app). By dropping
-        // the frame here we never call ta_parse on the bad data, so nothing throws.
-        {
-            const u8* p   = ctx->getTADataBegin();
-            const u8* end = ctx->getTADataEnd();
-            while (p + 4 <= end)
-            {
-                u32  pcw  = *(const u32*)p;
-                u32  para = (pcw >> 29) & 7;
-                if (para == 3 || para == 6)
-                {
-                    rc = nullptr;
-                    ++s_fault;
-                    if (s_fault <= 5 || (s_fault % 50) == 0)
-                    {
-                        char b[96];
-                        wsprintfA(b, "FLYCAST: bad ParaType %u pcw=%08x -- drop #%d\n",
-                                  para, pcw, s_fault);
-                        RDBG(b);
-                    }
-                    tc.CollectCleanup();
-                    return;
-                }
-                p += 32;  // minimum TA param block size
-            }
-        }
+        // The DC palette changed -> bump the generation so the shared hardware
+        // palettes refresh their colours next time they're bound (cheap).
+        if (updatePalette) { ++g_palGen; updatePalette = false; }
 
+        // ta_parse handles every real PVR param type; a genuinely malformed
+        // stream throws TAParserException, which the catch below absorbs (the
+        // EH machinery is fixed now -- see xbox_eh_shim.cpp). The old fixed-step
+        // "bad ParaType 3/6" pre-scan is gone: it walked the variable-length TA
+        // blocks in blind 32-byte steps, landed mid-vertex, misread coordinate
+        // floats (e.g. -36.0f = 0xC2100000, top 3 bits = 6) as control words,
+        // and dropped whole valid frames. Just let ta_parse do its job.
         try { ta_parse(ctx, false); }
         catch (...) { rc = nullptr; ++s_fault; RDBG("FLYCAST: ta_parse throw\n"); }
         tc.CollectCleanup();
@@ -284,6 +343,17 @@ struct XboxD3D8Renderer final : Renderer
 
         if (t && t->d3dtex)
         {
+            // gpuPalette (P8) textures: bind the hardware palette for THIS poly's
+            // PalSelect window before the texture. One index texture, many colours.
+            if (t->gpuPalette)
+            {
+                u32 off = (pp.tcw.PixelFmt == PixelPal4)
+                        ? ((u32)pp.tcw.PalSelect << 4)
+                        : (((u32)pp.tcw.PalSelect >> 4) << 8);
+                D3DPalette* pal = GetXboxPalette(off);
+                if (pal) dev->SetPalette(0, pal);
+            }
+
             dev->SetTexture(0, t->d3dtex);
 
             dev->SetTextureStageState(0, D3DTSS_ADDRESSU,
@@ -432,16 +502,36 @@ struct XboxD3D8Renderer final : Renderer
         if (nv > MAX_V) nv = MAX_V;
         if (ni > MAX_I) ni = MAX_I;
 
+        // DC depth is a per-vertex 1/w (larger = nearer). XYZRHW uses the .z
+        // field as the [0,1] z-buffer value (rhw stays = 1/w for perspective-
+        // correct texturing). Normalize 1/w across the frame: nearest (max 1/w)
+        // -> 0, farthest -> 1, paired with ZFUNC LESSEQUAL so near wins. Robust
+        // by construction (always in range); a degenerate range (pure 2D, all
+        // verts same 1/w) collapses to z=0 so painter's order via LESSEQUAL holds.
+        float minW = 3.4e38f, maxW = -3.4e38f;
+        for (int i = 0; i < nv; ++i)
+        {
+            float w = rc->verts[i].z;
+            if (w <= 0.f) continue;
+            if (w < minW) minW = w;
+            if (w > maxW) maxW = w;
+        }
+        const float wRange = maxW - minW;
+        const bool  flatZ  = !(wRange > 1e-9f);
+
         // Upload vertices
         TLVert* vp = nullptr;
         if (FAILED(vb->Lock(0, 0, (BYTE**)&vp, 0)) || !vp) return false;
         for (int i = 0; i < nv; ++i)
         {
             const Vertex& v = rc->verts[i];
+            float w = v.z > 0.f ? v.z : 1e-10f;
+            float z = flatZ ? 0.0f : (maxW - w) / wRange;   // near -> 0
+            if (z < 0.f) z = 0.f; else if (z > 1.f) z = 1.f;
             vp[i].x        = v.x;
             vp[i].y        = v.y;
-            vp[i].z        = 0.0f;
-            vp[i].rhw      = v.z > 0.f ? v.z : 1e-10f;
+            vp[i].z        = z;
+            vp[i].rhw      = w;
             vp[i].diffuse  = cvtCol(v.col);
             vp[i].specular = cvtCol(v.spc);
             vp[i].u        = v.u;
@@ -462,32 +552,6 @@ struct XboxD3D8Renderer final : Renderer
         m_nv = nv;
         m_ni = ni;
 
-        // Log every 30 rendered frames so xbwatson proves the DC is alive
-        ++s_frame;
-        if (s_frame <= 3 || (s_frame % 30) == 0)
-        {
-            char b[160];
-            wsprintfA(b, "FLYCAST: FRAME %d  nv=%d op=%d pt=%d tr=%d sorted=%d fault=%d\n",
-                      s_frame, nv,
-                      (int)rc->global_param_op.size(),
-                      (int)rc->global_param_pt.size(),
-                      (int)rc->global_param_tr.size(),
-                      (int)rc->sortedTriangles.size(),
-                      s_fault);
-            RDBG(b);
-            // Show raw vertex color + converted D3DCOLOR for first vertex of each opaque poly
-            for (int k = 0; k < (int)rc->global_param_op.size() && k < 4; ++k)
-            {
-                const PolyParam& pp = rc->global_param_op[k];
-                if (pp.count < 1 || pp.first >= (int)rc->idx.size()) continue;
-                const u8* c = rc->verts[rc->idx[pp.first]].col;
-                D3DCOLOR d = cvtCol(c);
-                wsprintfA(b, "FLYCAST:   op[%d] cnt=%d tex=%d raw=%02x%02x%02x%02x d3d=%08x\n",
-                          k, pp.count, pp.pcw.Texture, c[3],c[0],c[1],c[2], (unsigned)d);
-                RDBG(b);
-            }
-        }
-
         // ---- Render --------------------------------------------------------
         dev->SetRenderTarget(bb, ds);
         dev->Clear(0, NULL,
@@ -498,24 +562,35 @@ struct XboxD3D8Renderer final : Renderer
         dev->SetStreamSource(0, vb, sizeof(TLVert));
         dev->SetIndices(ib, 0);
 
-        dev->SetRenderState(D3DRS_ZENABLE,          FALSE);
-        dev->SetRenderState(D3DRS_ZWRITEENABLE,     FALSE);
-        dev->SetRenderState(D3DRS_CULLMODE,         D3DCULL_NONE);
-        dev->SetRenderState(D3DRS_ALPHATESTENABLE,  FALSE);
-        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->SetRenderState(D3DRS_ZENABLE,  TRUE);
+        dev->SetRenderState(D3DRS_ZFUNC,    D3DCMP_LESSEQUAL);   // near (z=0) wins
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
 
         // Disable stage 1+ so they don't interfere
         dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
         dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-        drawList(rc->global_param_op);   // opaque  (SRC=ONE / DST=ZERO)
-        drawList(rc->global_param_pt);   // punch-through
+        // 1) Opaque: write depth, no blend, no alpha test.
+        dev->SetRenderState(D3DRS_ZWRITEENABLE,     TRUE);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE,  FALSE);
+        drawList(rc->global_param_op);
 
-        // When autosort is active, ta_util builds a back-to-front triangle list
-        // in rc->sortedTriangles and does NOT call makeIndex on global_param_tr.
-        // global_param_tr.pp.first/count hold raw vertex ranges in that case —
-        // using them as index-buffer offsets produces exploded geometry.
-        // Use drawSortedTr() when sortedTriangles is populated.
+        // 2) Punch-through: write depth, alpha-test discards the transparent
+        //    texels (1-bit alpha) so they don't occlude what's behind them.
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE,  TRUE);
+        dev->SetRenderState(D3DRS_ALPHAREF,         0x80);
+        dev->SetRenderState(D3DRS_ALPHAFUNC,        D3DCMP_GREATEREQUAL);
+        drawList(rc->global_param_pt);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE,  FALSE);
+
+        // 3) Translucent: test depth against the opaque/PT pass but DON'T write
+        //    it, blend, drawn back-to-front. When autosort is active ta_util
+        //    builds the sorted triangle list in rc->sortedTriangles (and does
+        //    NOT makeIndex global_param_tr, whose first/count are then raw vertex
+        //    ranges) -- so use drawSortedTr() whenever that list is populated.
+        dev->SetRenderState(D3DRS_ZWRITEENABLE,     FALSE);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
         if (!rc->sortedTriangles.empty())
             drawSortedTr();
         else

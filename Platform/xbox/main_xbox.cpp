@@ -14,6 +14,10 @@
 #include <sstream>
 #include <locale>
 #include <string>
+#include <cstdio>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 
 #include "build.h"
 #include "types.h"
@@ -82,9 +86,19 @@ static void DBGHEX(const char* tag, unsigned v)
 // SEH capture: an access violation in loadGame/dc_reset is a STRUCTURED
 // exception, not a C++ one, so our catch(...) misses it. Catch it here and
 // print the faulting code+address (map via image = runtime + 0x3EF000).
+extern "C" int xbox_FastmemFault(struct _EXCEPTION_POINTERS* ep);
+extern "C" volatile unsigned g_fault_total;   // xbox_fault_handler.cpp
+
 static unsigned g_sehCode = 0, g_sehAddr = 0;
 static int sehFilter(struct _EXCEPTION_POINTERS* ep)
 {
+    // fastmem fast-path rewrite / FPCB demand-commit / SMC+texture protection.
+    // Resolving returns CONTINUE_EXECUTION -> resume the faulting instruction
+    // WITHOUT unwinding (the RWX-origin unwind path still hangs, and fastmem
+    // never needs it).
+    if (xbox_FastmemFault(ep) == EXCEPTION_CONTINUE_EXECUTION)
+        return EXCEPTION_CONTINUE_EXECUTION;
+
     g_sehCode = ep->ExceptionRecord->ExceptionCode;
     g_sehAddr = (unsigned)(size_t)ep->ExceptionRecord->ExceptionAddress;
     return EXCEPTION_EXECUTE_HANDLER;
@@ -119,7 +133,11 @@ static bool initD3D()
     pp.AutoDepthStencilFormat          = D3DFMT_D24S8;
     pp.SwapEffect                      = D3DSWAPEFFECT_COPY;   // persistent backbuffer (like the PC framebuffer)
     pp.FullScreen_RefreshRateInHz      = 60;
-    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+    // IMMEDIATE (no vsync): INTERVAL_ONE blocks Present() until vblank, quantizing
+    // the frame rate to 60/N (so ~42ms of real work showed as 50ms=20fps, ~21ms as
+    // 33ms=30fps). Uncapping presents the true rate -- the menu's ~42ms -> ~24fps,
+    // the boot's ~21ms -> ~45fps. (May tear; fine for now / can cap to game rate later.)
+    pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     Direct3D_SetPushBufferSize(768 * 1024, 128 * 1024);
 
     if (FAILED(g_d3d->CreateDevice(0, D3DDEVTYPE_HAL, NULL,
@@ -134,12 +152,25 @@ static bool initD3D()
 // destructors here (emu calls take const char*/no args) -> no /EH unwind clash.
 extern Renderer* rend_DirectX9();   // our D3D8 renderer (xbox_d3d8_renderer.cpp)
 
+// fastmem / SMC / FPCB-demand fault handler installer (xbox_fault_handler.cpp).
+void os_InstallFaultHandler();
+// Xbox controller -> DC maple input (xbox_input.cpp).
+void xbox_InitInput();
+void xbox_PollInput();
+
 static bool runEmu()
 {
     __try
     {
-        // Reserve the guest address space (virtmem 512MB window; more RAM-
-        // efficient than the malloc fallback). Must precede emu.init()/initMappings.
+        // Install the process-wide fault handler BEFORE any JIT runs. Now that
+        // xbox_eh_shim.cpp's __CxxFrameHandler3 lets foreign (access-violation)
+        // exceptions from JIT code propagate cleanly through C++ frames, fastmem
+        // MMIO faults + reserved-FPCB reads reach xbox_FastmemFault and resume.
+        DBG("FLYCAST: os_InstallFaultHandler()\n");
+        os_InstallFaultHandler();
+
+        // Reserve the guest address space (virtmem 512MB fastmem window). Must
+        // precede emu.init()/initMappings, which branch on ram_base.
         DBG("FLYCAST: addrspace::reserve()\n");
         if (!addrspace::reserve())
             DBG("FLYCAST: *** addrspace::reserve FAILED ***\n");
@@ -154,8 +185,14 @@ static bool runEmu()
             DBG("FLYCAST: *** D3D8 renderer Init FAILED ***\n");
         DBG("FLYCAST: emu.init()\n");
         emu.init();
-        DBG("FLYCAST: emu.loadGame(\"\")\n");
-        emu.loadGame("");
+        // Boot a real game disc. The Media tree is packed to D:\Media\ by the
+        // post-build xcopy/xdvdfs step, so this GDI + its 27 tracks ride along
+        // inside the ISO. Pass "" instead to boot to the BIOS menu.
+        static const char* GAME_PATH = "D:\\Media\\Mr. Driller [USA]\\disc.gdi";
+        DBG("FLYCAST: emu.loadGame(\"");
+        DBG(GAME_PATH);
+        DBG("\")\n");
+        emu.loadGame(GAME_PATH);
         // loadGame() runs config::Settings::reset(), which re-defaults
         // ThreadedRendering back to TRUE -- undoing the override we set before
         // loadGame. Re-assert it FALSE here so emu.start() takes the
@@ -169,6 +206,8 @@ static bool runEmu()
         DBG("FLYCAST: emu.start()\n");
         emu.start();
         DBG("FLYCAST: emu.start() RETURNED; entering render loop\n");
+        // Bring up the Xbox controller(s) -> DC maple input.
+        xbox_InitInput();
         // YELLOW baseline until the D3D8 renderer draws the first DC frame over it.
         clearScreen(D3DCOLOR_XRGB(160, 160, 0));
         // PERF PROBE: split per-frame wall time into render(D3D8) vs emulation
@@ -178,9 +217,11 @@ static bool runEmu()
         long long renderBase = g_renderUs;
         long long emuUsAcc = 0;
         unsigned frame = 0;
+        unsigned faultBase = g_fault_total;
         for (;;)                       // run the BIOS forever; renderer presents each frame
         {
             os_DoEvents();
+            xbox_PollInput();          // Xbox pad -> mapleInputState[]
             LARGE_INTEGER a; QueryPerformanceCounter(&a);
             emu.render();
             LARGE_INTEGER b; QueryPerformanceCounter(&b);
@@ -191,9 +232,12 @@ static bool runEmu()
                 renderBase = g_renderUs;
                 int totalMs  = (int)(emuUsAcc / 60 / 1000);
                 int rendMs   = (int)(renderUs / 60 / 1000);
-                char buf[160];
-                wsprintfA(buf, "FLYCAST PERF: %dms/frame total | render=%dms emu=%dms (%d fps)\n",
-                          totalMs, rendMs, totalMs - rendMs, totalMs > 0 ? 1000 / totalMs : 0);
+                unsigned faults = g_fault_total - faultBase;
+                faultBase = g_fault_total;
+                char buf[220];
+                wsprintfA(buf, "FLYCAST PERF: %dms/frame emu=%dms (%d fps) faults=%u pc=%08x pr=%08x\n",
+                          totalMs, totalMs - rendMs, totalMs > 0 ? 1000 / totalMs : 0, faults,
+                          (unsigned)Sh4cntx.pc, (unsigned)Sh4cntx.pr);
                 OutputDebugStringA(buf);
                 emuUsAcc = 0;
             }

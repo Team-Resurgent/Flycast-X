@@ -52,14 +52,14 @@
       <SDLCheck>false</SDLCheck>
       <!-- NO_REND => null renderer (we replace it at runtime with our D3D8 renderer).
            _NTOS_ => suppress RXDK winbase Interlocked clash with VS2022 intrinsics.
-           TARGET_NO_REC => interpreter SH-4 (build.h forces all DYNAREC_NONE).
-           The x86 JIT can't reach NXDK-port speeds on RXDK: fastmem needs the
-           runtime to deliver JIT-code faults and RXDK doesn't, while the no-fastmem
-           JIT is slower (memory ops become calls vs the interpreter's inline access)
-           with a slow compile-heavy boot. So we stay on the interpreter and improve
-           it / the renderer instead. Compatibility headers live in flycast_shim/
-           (don't delete). Re-enable JIT: remove TARGET_NO_REC, add FEAT_DSPREC. -->
-      <PreprocessorDefinitions>XBOX;_XBOX;NDEBUG;_NTOS_;_WIN32_WINNT=0x0600;NO_REND;FEAT_NO_MINIUPNPC;TARGET_NO_REC;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;NOMINMAX;_USE_MATH_DEFINES;_7ZIP_ST;ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+           FASTMEM JIT: TARGET_NO_REC removed => x86 SH-4 JIT + virtmem fastmem.
+           Unblocked 2026-06-29 by xbox_eh_shim.cpp's correct __CxxFrameHandler3:
+           access-violation faults from JIT code now propagate through C++ frames
+           to xbox_FastmemFault (which resumes via CONTINUE_EXECUTION), so the JIT's
+           direct [ecx+ram_base] loads + reserved-FPCB demand paging work. This is
+           the NXDK-equivalent fast path on RXDK. FEAT_DSPREC=DYNAREC_NONE keeps the
+           AICA DSP interpreted. flycast_shim/ headers required (don't delete). -->
+      <PreprocessorDefinitions>XBOX;_XBOX;NDEBUG;_NTOS_;_WIN32_WINNT=0x0600;NO_REND;FEAT_NO_MINIUPNPC;FEAT_DSPREC=DYNAREC_NONE;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;NOMINMAX;_USE_MATH_DEFINES;_7ZIP_ST;ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <BufferSecurityCheck>false</BufferSecurityCheck>
@@ -79,7 +79,11 @@
            stub) from it; everything else resolves from our objs + RXDK first. -->
       <AdditionalDependencies>xboxkrnl.lib;libcmt.lib;libcpmt.lib;oldnames.lib;xapilib.lib;d3d8.lib;d3dx8.lib;xgraphics.lib;dsound.lib</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
-      <AdditionalOptions>/ALTERNATENAME:___CxxFrameHandler3=___CxxFrameHandler "/ALTERNATENAME:??_L@YGXPAXIIP6EX0@Z1@Z=??_L@YGXPAXIHP6EX0@Z1@Z" "/ALTERNATENAME:??_M@YGXPAXIIP6EX0@Z@Z=??_M@YGXPAXIHP6EX0@Z@Z" /ignore:4254 /FORCE:MULTIPLE %(AdditionalOptions)</AdditionalOptions>
+      <!-- __CxxFrameHandler3 is now provided by xbox_eh_shim.cpp (a correct
+           personality routine that doesn't hang on RWX-origin foreign exceptions),
+           NOT aliased to the old __CxxFrameHandler. The ??_L/??_M aliases (EH
+           vector ctor/dtor iterator security variants) are still bridged. -->
+      <AdditionalOptions>"/ALTERNATENAME:??_L@YGXPAXIIP6EX0@Z1@Z=??_L@YGXPAXIHP6EX0@Z1@Z" "/ALTERNATENAME:??_M@YGXPAXIIP6EX0@Z@Z=??_M@YGXPAXIHP6EX0@Z@Z" /ignore:4254 /FORCE:MULTIPLE %(AdditionalOptions)</AdditionalOptions>
       <GenerateMapFile>true</GenerateMapFile>
       <FixedBaseAddress>false</FixedBaseAddress>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
@@ -121,6 +125,8 @@ if not exist "$(OutDir)XISO" mkdir "$(OutDir)XISO"
          wildcards so /FORCE:MULTIPLE picks our versions. -->
     <ClCompile Include="xbox_dynarec_shim.cpp" />
     <ClCompile Include="xbox_fault_handler.cpp" />
+    <ClCompile Include="xbox_eh_shim.cpp" />
+    <ClCompile Include="xbox_input.cpp" />
     <!-- root -->
     <ClCompile Include="$(FLY)\core\stdclass.cpp" />
     <ClCompile Include="$(FLY)\core\emulator.cpp" />
@@ -151,6 +157,7 @@ if not exist "$(OutDir)XISO" mkdir "$(OutDir)XISO"
     <ClCompile Remove="$(FLY)\core\hw\aica\dsp_arm32.cpp" />
     <ClCompile Remove="$(FLY)\core\hw\aica\dsp_arm64.cpp" />
     <ClCompile Remove="$(FLY)\core\hw\aica\dsp_x64.cpp" />
+    <ClCompile Remove="$(FLY)\core\hw\aica\dsp_x86.cpp" />
     <ClCompile Remove="$(FLY)\core\hw\aica\dsp_x86.cpp" />
     <!-- hw/arm7 (exclude AREC backends) -->
     <ClCompile Include="$(FLY)\core\hw\arm7\*.cpp" />

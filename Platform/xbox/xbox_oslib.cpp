@@ -169,12 +169,22 @@ namespace virtmem
         }
     }
 
-    // No-ops on the interpreter build: real VirtualProtect-based page protection
-    // only matters for the JIT (SMC/texture faults), which is disabled here and
-    // can't deliver those faults on Xbox anyway. The interpreter handles SMC and
-    // texture invalidation through its normal write paths.
-    bool region_lock(void* /*start*/, std::size_t /*len*/)   { return true; }
-    bool region_unlock(void* /*start*/, std::size_t /*len*/) { return true; }
+    // Real page protection (REQUIRED for the JIT now that xbox_eh_shim.cpp makes
+    // faults dispatch): bm_LockPage marks RAM pages holding compiled code
+    // read-only; a guest write (self-modifying code) faults -> xbox_FastmemFault
+    // -> bm_RamWriteAccess discards the stale block + unprotects -> recompiled
+    // with the new code. Without this the JIT runs STALE blocks after the BIOS
+    // patches RAM, and spins forever in a wait loop.
+    bool region_lock(void* start, std::size_t len)
+    {
+        DWORD old;
+        return VirtualProtect(start, len, PAGE_READONLY, &old) != 0;
+    }
+    bool region_unlock(void* start, std::size_t len)
+    {
+        DWORD old;
+        return VirtualProtect(start, len, PAGE_READWRITE, &old) != 0;
+    }
 
     // JIT code cache: RWX from the kernel. (Only used if the SH-4 JIT is ever
     // re-enabled; the interpreter build never calls this.)

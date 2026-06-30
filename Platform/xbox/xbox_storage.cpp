@@ -10,8 +10,6 @@
 #include <string>
 #include <vector>
 
-extern "C" void __stdcall OutputDebugStringA(const char*);
-
 namespace hostfs
 {
 
@@ -23,9 +21,6 @@ public:
     File* openFile(const std::string& path, const std::string& mode) override
     {
         FILE* f = std::fopen(path.c_str(), mode.c_str());
-        OutputDebugStringA(f ? "FLYCAST openFile OK: " : "FLYCAST openFile FAIL: ");
-        OutputDebugStringA(path.c_str());
-        OutputDebugStringA("\n");
         return f ? new StdFile(f) : nullptr;
     }
 

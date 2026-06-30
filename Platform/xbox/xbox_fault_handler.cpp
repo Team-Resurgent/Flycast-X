@@ -61,60 +61,30 @@ volatile unsigned g_fault_lastpc   = 0;   // last faulting Eip
 // or 0 if it's a genuine crash the caller should handle/report.
 extern "C" int xbox_FastmemFault(EXCEPTION_POINTERS* ep)
 {
-    // Entry trace: prove the handler is reached at all, and with what code.
-    static unsigned s_entries = 0;
-    if (++s_entries <= 50)
-    {
-        char eb[96];
-        wsprintfA(eb, "FLTENTRY #%u code=%08x addr=%08x\n", s_entries,
-                  (unsigned)ep->ExceptionRecord->ExceptionCode,
-                  (unsigned)ep->ExceptionRecord->ExceptionInformation[1]);
-        OutputDebugStringA(eb);
-    }
-
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
         return 0;
 
     u8* address = (u8*)ep->ExceptionRecord->ExceptionInformation[1];
-    const unsigned pc = (unsigned)ep->ContextRecord->Eip;
     ++g_fault_total;
-    g_fault_lastaddr = (unsigned)(size_t)address;
-    g_fault_lastpc   = pc;
-
-    int   disp = 0;          // EXCEPTION_CONTINUE_EXECUTION if resolved
-    const char* who = "BAD";
 
     // ram watcher (GGPO; no-op here) / SMC code protection / texture protection
-    if (memwatch::writeAccess(address))            { who = "watch"; disp = EXCEPTION_CONTINUE_EXECUTION; }
-    else if (bm_RamWriteAccess(address))           { ++g_fault_ramsmc; who = "smc"; disp = EXCEPTION_CONTINUE_EXECUTION; }
-    else if (VramLockedWrite(address))             { ++g_fault_vram;   who = "vram"; disp = EXCEPTION_CONTINUE_EXECUTION; }
+    if (memwatch::writeAccess(address))            return EXCEPTION_CONTINUE_EXECUTION;
+    if (bm_RamWriteAccess(address))                { ++g_fault_ramsmc; return EXCEPTION_CONTINUE_EXECUTION; }
+    if (VramLockedWrite(address))                  { ++g_fault_vram;   return EXCEPTION_CONTINUE_EXECUTION; }
     // FPCB jump-table demand paging (commit + fill the reserved page).
-    else if (addrspace::bm_lockedWrite(address))   { ++g_fault_fpcb;   who = "fpcb"; disp = EXCEPTION_CONTINUE_EXECUTION; }
-    else
-    {
-        // fastmem fast-path access to MMIO / uncommitted mirror: rewrite to slow.
-        host_context_t ctx;
-        readContext(ep, ctx);
-        if (sh4Dynarec != nullptr && sh4Dynarec->rewrite(ctx, address))
-        {
-            ++g_fault_rewrite;
-            writeContext(ep, ctx);
-            who = "rewrite"; disp = EXCEPTION_CONTINUE_EXECUTION;
-        }
-        else
-            ++g_fault_unhandled;
-    }
+    if (addrspace::bm_lockedWrite(address))        { ++g_fault_fpcb;   return EXCEPTION_CONTINUE_EXECUTION; }
 
-    // Diagnostics: print the first 40 faults, then every 4000th, so we can see
-    // the startup sequence and detect a storm (same addr repeating forever).
-    if (g_fault_total <= 40 || (g_fault_total % 4000) == 0)
+    // fastmem fast-path access to MMIO / uncommitted mirror: rewrite to slow.
+    host_context_t ctx;
+    readContext(ep, ctx);
+    if (sh4Dynarec != nullptr && sh4Dynarec->rewrite(ctx, address))
     {
-        char b[128];
-        wsprintfA(b, "FLT #%u %s addr=%08x pc=%08x\n", g_fault_total, who,
-                  (unsigned)(size_t)address, pc);
-        OutputDebugStringA(b);
+        ++g_fault_rewrite;
+        writeContext(ep, ctx);
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
-    return disp;
+    ++g_fault_unhandled;
+    return 0;   // genuine fault
 }
 
 // ---- Top-level (unhandled) exception filter ------------------------------

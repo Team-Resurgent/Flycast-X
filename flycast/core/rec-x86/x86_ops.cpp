@@ -706,6 +706,58 @@ void X86Compiler::genOpcode(RuntimeBlockInfo* block, bool optimise, shil_opcode&
 			movaps(xword[ecx + (i * 16)], xmm0);
 		}
 		break;
+
+	// SSE1 vector FPU ops. Without these every FIPR/FTRV becomes a marshalled
+	// C call (shil_chf canonical path) -- 3D games execute tens of thousands
+	// per frame for geometry transform and lighting. Vector operands (count>2)
+	// are never register-allocated: the allocator write-back-flushes sources
+	// and hard-flushes destinations at OpBegin, so ctx memory is coherent and
+	// 16-byte aligned (same guarantees shop_frswap above relies on). xmm0-3
+	// are scratch (the allocator only uses xmm4-7). Single-precision result
+	// (canonical sums in double) -- same tradeoff the ARM backends make.
+	case shop_fipr:
+		// rd = dot4(rs1, rs2)
+		mov(eax, (uintptr_t)op.rs1.reg_ptr(sh4ctx));
+		movaps(xmm0, xword[eax]);
+		if (op.rs2._reg == op.rs1._reg)
+			mulps(xmm0, xmm0);
+		else
+		{
+			mov(ecx, (uintptr_t)op.rs2.reg_ptr(sh4ctx));
+			mulps(xmm0, xword[ecx]);
+		}
+		// horizontal add without SSE3: [x y z w] -> x+z, y+w -> sum
+		movhlps(xmm1, xmm0);
+		addps(xmm0, xmm1);			// lane0 = x+z, lane1 = y+w
+		movaps(xmm1, xmm0);
+		shufps(xmm1, xmm1, 1);		// lane0 = y+w
+		addss(xmm0, xmm1);
+		host_reg_to_shil_param(op.rd, xmm0);
+		break;
+
+	case shop_ftrv:
+		// rd[j] = sum_i rs1[i] * rs2[j + 4*i]  (XMTRX)
+		// = rs1[0]*M[0..3] + rs1[1]*M[4..7] + rs1[2]*M[8..11] + rs1[3]*M[12..15]
+		mov(eax, (uintptr_t)op.rs1.reg_ptr(sh4ctx));
+		mov(ecx, (uintptr_t)op.rs2.reg_ptr(sh4ctx));
+		movaps(xmm3, xword[eax]);	// load the full vector first: rd may alias rs1
+		movaps(xmm0, xmm3);
+		shufps(xmm0, xmm0, 0x00);	// broadcast v0
+		mulps(xmm0, xword[ecx]);
+		movaps(xmm1, xmm3);
+		shufps(xmm1, xmm1, 0x55);	// v1
+		mulps(xmm1, xword[ecx + 16]);
+		addps(xmm0, xmm1);
+		movaps(xmm2, xmm3);
+		shufps(xmm2, xmm2, 0xAA);	// v2
+		mulps(xmm2, xword[ecx + 32]);
+		addps(xmm0, xmm2);
+		shufps(xmm3, xmm3, 0xFF);	// v3
+		mulps(xmm3, xword[ecx + 48]);
+		addps(xmm0, xmm3);
+		mov(eax, (uintptr_t)op.rd.reg_ptr(sh4ctx));
+		movaps(xword[eax], xmm0);
+		break;
 #endif
 
 	default:

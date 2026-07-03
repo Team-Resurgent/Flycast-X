@@ -715,8 +715,12 @@ struct ChannelEx
 
 	static void StepAll(SampleType& mixl, SampleType& mixr)
 	{
+		// Disabled channels contribute exact zeros to every mix bus, so they
+		// can be skipped outright. Games rarely key on more than a dozen of
+		// the 64 channels, and this runs 44100 times per second.
 		for (ChannelEx& channel : Chans)
-			channel.Step(mixl, mixr);
+			if (channel.enabled)
+				channel.Step(mixl, mixr);
 	}
 
 	void SetAegState(EGState newstate)

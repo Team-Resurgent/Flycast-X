@@ -89,13 +89,20 @@ constexpr int AICA_TICK = 4535;		// 44.1 KHz
 extern "C" volatile long long g_prof_arm_cyc;
 extern "C" volatile long long g_prof_aica_cyc;
 
+// Xbox port: samples generated per scheduler tick. Each tick costs a full SH4
+// JIT mainloop exit + scheduler dispatch + re-entry (~735/frame at 1). Batching
+// cuts that churn; per-sample semantics (timers, mixing, ARM slices) are kept
+// inside arm::run's loop -- only SH4-visible AICA interrupt latency coarsens,
+// by (kAicaBatch-1) samples (23us each) worst case.
+static const int kAicaBatch = 4;
+
 static int AicaUpdate(int tag, int cycles, int jitter, void *arg)
 {
 	unsigned long long _t = __rdtsc();
-	arm::run(1);				// ARM7 sound CPU + per-sample timeStep (profiled)
+	arm::run(kAicaBatch);		// ARM7 sound CPU + per-sample timeStep (profiled)
 	g_prof_arm_cyc += (long long)(__rdtsc() - _t);
 
-	return AICA_TICK;
+	return AICA_TICK * kAicaBatch;
 }
 
 //Mainloop

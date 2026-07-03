@@ -566,9 +566,19 @@ static void DYNACALL ta_thd_data32_i(const simd256_t *data)
 	}
 }
 
+// Component profiler (Xbox port): measures the TA vertex-parsing share of the
+// "sh4" bucket. rdtsc pair per 32-byte chunk costs ~1-2ms/frame at 3D-game SQ
+// volumes -- acceptable in kPerfLog validation builds, and g_cnt_ta stays cheap.
+#include <intrin.h>
+extern "C" volatile long long g_prof_ta_cyc;
+extern "C" unsigned g_cnt_ta;
+
 void DYNACALL ta_vtx_data32(const SQBuffer *data)
 {
+	unsigned long long _t = __rdtsc();
 	ta_thd_data32_i((const simd256_t *)data);
+	g_prof_ta_cyc += (long long)(__rdtsc() - _t);
+	++g_cnt_ta;
 }
 
 void ta_vtx_data(const SQBuffer *data, u32 size)

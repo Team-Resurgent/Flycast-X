@@ -89,6 +89,8 @@ public:
 
 	u32 dirty;			// frame number at which texture was overwritten
 	u32 lastUsedFrame = 0;	// frame number at which texture was last looked up (LRU eviction)
+	u32 lastInvFrame = 0;	// frame of the previous invalidate() (volatile-texture detection)
+	u32 invStreak = 0;		// consecutive-frame invalidation count (see Update())
 	vram_block* lock_block;
 
 	u32 mmStartAddress; // pixel data start address of max level mipmap

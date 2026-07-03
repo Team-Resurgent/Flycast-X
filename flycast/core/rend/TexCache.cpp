@@ -33,6 +33,10 @@ extern bool pal_needs_update;
 // Xbox where SA1/MvC2 stream more textures than the heap can hold. Default 0.
 volatile int textureMemPressure = 0;
 
+// Perf counter (printed by the Xbox port): uploads that skipped re-protection
+// because the texture is rewritten every frame (see Update()).
+extern "C" unsigned g_stat_volatileTex = 0;
+
 // Rough approximation of LoD bias from D adjust param, only used to increase LoD
 const std::array<f32, 16> D_Adjust_LoD_Bias = {
 		0.f, -4.f, -2.f, -1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f
@@ -682,7 +686,18 @@ bool BaseTextureCacheData::Update()
 		mipmapped = false;
 	}
 	//lock the texture to detect changes in it
-	protectVRam();
+	if (invStreak >= 4 && ((FrameCount + (startAddress >> 3)) & 63) != 0)
+	{
+		// Volatile texture: the game rewrites it (nearly) every frame, so
+		// protecting it again only buys one page fault plus two VirtualProtect
+		// kernel calls before the next rewrite. Stay dirty instead so the next
+		// lookup re-uploads unconditionally, at zero fault cost. Every 64th
+		// frame protection is re-armed so this decays once the writes stop.
+		dirty = FrameCount;
+		g_stat_volatileTex++;
+	}
+	else
+		protectVRam();
 
 	UploadToGPU(upscaled_w, upscaled_h, (const u8 *)temp_tex_buffer, IsMipmapped(), mipmapped);
 	if (config::DumpTextures)
@@ -1257,6 +1272,8 @@ template void WriteFramebuffer<2, 1, 0, 3>(u32 width, u32 height, const u8 *data
 void BaseTextureCacheData::invalidate()
 {
 	dirty = FrameCount;
+	invStreak = FrameCount - lastInvFrame <= 2 ? invStreak + 1 : 1;
+	lastInvFrame = FrameCount;
 
 	libCore_vramlock_Unlock_block_wb(lock_block);
 	lock_block = nullptr;

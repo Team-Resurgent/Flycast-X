@@ -118,6 +118,8 @@ extern "C" volatile unsigned g_fault_lastpc;
 extern "C" volatile long long g_prof_arm_cyc  = 0;   // ARM7 sound CPU (interpreted)
 extern "C" volatile long long g_prof_aica_cyc = 0;   // AICA sample gen + DSP (interpreted)
 extern "C" volatile long long g_prof_tex_cyc  = 0;   // texture upload + format convert
+extern "C" volatile long long g_prof_ta_cyc   = 0;   // TA vertex parsing (ta.cpp, part of "sh4")
+extern "C" unsigned           g_cnt_ta        = 0;   // ta_vtx_data32 calls (32-byte chunks)
 extern "C" volatile unsigned  g_arm_fallbacks = 0;   // ARM7 JIT -> interpreter fallbacks
 
 // MMU diagnostics (mmu.cpp): direct measurement of mmu_data_translation, since
@@ -206,6 +208,7 @@ extern "C" volatile unsigned g_stat_verts;
 extern "C" volatile unsigned g_stat_idx;
 extern "C" volatile unsigned g_stat_polys;
 extern "C" unsigned g_stat_vbLockUs;   // GPU-sync stall time in VB/IB Lock
+extern "C" unsigned g_stat_volatileTex;	// uploads that skipped re-protection (TexCache.cpp)
 
 static unsigned g_sehCode = 0, g_sehAddr = 0;
 static int sehFilter(struct _EXCEPTION_POINTERS* ep)
@@ -345,7 +348,9 @@ static const bool kDebugTrace = false;
 // (together with kJitCounters in rec_x86.cpp/x86_ops.cpp for the JITCNT
 // counts) when profiling. The texture byte-budget / memory-pressure logic is
 // NOT affected -- it runs unconditionally in the frame loop.
-static const bool kPerfLog = false;
+// Currently TRUE: validating the AICA channel-skip + volatile-texture round
+// (watch aica=, vram=, volTex/w=). Flip back to false for release.
+static const bool kPerfLog = true;
 
 static volatile unsigned g_mainLoopBeat = 0;
 static DWORD WINAPI watchdogThread(LPVOID)
@@ -570,6 +575,7 @@ static bool runEmu()
             if (cycPerUs < 1) cycPerUs = 1;
         }
         long long armBase = g_prof_arm_cyc, aicaBase = g_prof_aica_cyc, texBase = g_prof_tex_cyc;
+        long long taBase = g_prof_ta_cyc;  unsigned taCntBase = g_cnt_ta;
         unsigned armFbBase = g_arm_fallbacks;
         unsigned drawBase = g_stat_drawCalls, stateCallBase = g_stat_stateCalls;
         unsigned stateSkipBase = g_stat_stateSkipped, polyBase = g_stat_polys;
@@ -717,6 +723,13 @@ static bool runEmu()
                           (int)rendUsPf, (int)texUsPf, armFbPf);
                 OutputDebugStringA(buf);
 
+                // TA vertex-parsing share of the sh4 bucket (direct measurement,
+                // includes the rdtsc probe's own overhead -- treat as upper bound).
+                long long taUsPf = (g_prof_ta_cyc - taBase) / cycPerUs / 60;  taBase = g_prof_ta_cyc;
+                unsigned taCntPf = (g_cnt_ta - taCntBase) / 60;  taCntBase = g_cnt_ta;
+                wsprintfA(buf, "  TA: us/f=%d chunks/f=%u\n", (int)taUsPf, taCntPf);
+                OutputDebugStringA(buf);
+
                 // Direct MMU data-translation measurement (mmu.cpp): mmuUs is
                 // microseconds/frame ACTUALLY spent in mmu_data_translation (a
                 // real, direct number, not inferred). calls/f = total invocations;
@@ -831,8 +844,9 @@ static bool runEmu()
                 unsigned skipPf = (g_stat_stateSkipped - stateSkipBase) / 60;  stateSkipBase = g_stat_stateSkipped;
                 unsigned polyPf = (g_stat_polys - polyBase) / 60;  polyBase = g_stat_polys;
                 unsigned vbLockPf = g_stat_vbLockUs / 60;  g_stat_vbLockUs = 0;
-                wsprintfA(buf, "  RENDER: draws/f=%u polys/f=%u stateSet/f=%u stateSkip/f=%u verts=%u idx=%u vbLock/f=%uus\n",
-                          drawPf, polyPf, setPf, skipPf, g_stat_verts, g_stat_idx, vbLockPf);
+                unsigned volTexW = g_stat_volatileTex;  g_stat_volatileTex = 0;
+                wsprintfA(buf, "  RENDER: draws/f=%u polys/f=%u stateSet/f=%u stateSkip/f=%u verts=%u idx=%u vbLock/f=%uus volTex/w=%u\n",
+                          drawPf, polyPf, setPf, skipPf, g_stat_verts, g_stat_idx, vbLockPf, volTexW);
                 OutputDebugStringA(buf);
                 emuUsAcc = 0;
             }

@@ -100,7 +100,11 @@ typedef union
 alignas(8) extern reg_pair arm_Reg[RN_ARM_REG_COUNT];
 
 // AICA ARM cpu clock: 22.5792 MHz
-#define ARM_CYCLES_PER_SAMPLE (AICA_ARM_CLOCK / 44100)
+// Xbox port: emulate the ARM7 at 75% of nominal (192 instead of 256 cycles per
+// sample). The Sega sound driver uses a fraction of the real chip; this cuts
+// the ARM7 JIT cost proportionally. If music/SFX ever misbehave in a game,
+// restore the full clock (remove the * 3 / 4) before suspecting anything else.
+#define ARM_CYCLES_PER_SAMPLE ((AICA_ARM_CLOCK / 44100) * 3 / 4)
 extern int arm7ClockTicks;
 
 extern bool armIrqEnable;

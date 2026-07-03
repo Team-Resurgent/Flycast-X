@@ -286,6 +286,16 @@ public:
 // ---------------------------------------------------------------------------
 static const int MAX_V = 32768;
 static const int MAX_I = 65536;
+// The index buffer holds the original strip indices [0, ni) PLUS merged strip
+// runs appended after them (see Render()). Consecutive same-state polys are
+// stitched into ONE long strip with degenerate bridges (2 extra indices per
+// join) and drawn with ONE DrawIndexedPrimitive -- 3D games issue 600-1200
+// tiny strips per frame (~8 verts per call) and per-call overhead was 2-5ms
+// of rend time. NOTE: strips, NOT triangle lists -- NV2A indices are CPU-
+// pushed into the command buffer per draw, so a 3x list conversion costs more
+// than the calls it saves (measured). Worst-case appended size = MAX_I strip
+// indices + 2 per poly, well within the spare region.
+static const int MAX_TRI_I = MAX_I + 98304;
 
 struct XboxD3D8Renderer final : Renderer
 {
@@ -302,6 +312,12 @@ struct XboxD3D8Renderer final : Renderer
     int                     geoBuf = 0;
     IDirect3DSurface8*      bb   = nullptr;   // backbuffer (D3DSWAPEFFECT_COPY keeps it alive)
     IDirect3DSurface8*      ds   = nullptr;   // depth+stencil
+    // Merged draw runs (see MAX_TRI_I): one entry per DrawIndexedPrimitive.
+    // first/idxCount address either the appended merged-strip region or (for
+    // overflow fallback) the original strip region; poly indexes the list's
+    // PolyParam whose state applies to the whole run.
+    struct DrawRun { u32 first, idxCount, poly, nPolys; };
+    std::vector<DrawRun> runsOp, runsPt, runsTr;
     XboxTexCache            tc;
     rend_context*           rc      = nullptr;
     int                     m_nv   = 0;
@@ -334,7 +350,7 @@ struct XboxD3D8Renderer final : Renderer
             if (FAILED(dev->CreateVertexBuffer(MAX_V * sizeof(TLVert), 0, 0,
                            D3DPOOL_DEFAULT, &vbs[i]))) return false;
 
-            if (FAILED(dev->CreateIndexBuffer(MAX_I * 2, 0, D3DFMT_INDEX16,
+            if (FAILED(dev->CreateIndexBuffer(MAX_TRI_I * 2, 0, D3DFMT_INDEX16,
                            D3DPOOL_DEFAULT, &ibs[i]))) return false;
         }
 
@@ -495,20 +511,29 @@ struct XboxD3D8Renderer final : Renderer
         APPLY_STATE(c_srcBlend, wantSrc, dev->SetRenderState(D3DRS_SRCBLEND,  wantSrc));
         APPLY_STATE(c_dstBlend, wantDst, dev->SetRenderState(D3DRS_DESTBLEND, wantDst));
 
-        ++g_stat_polys;
 #undef APPLY_STATE
     }
 
-    void drawList(std::vector<PolyParam>& polys)
+    // Everything applyPoly derives its state from. Two polys comparing equal
+    // here produce byte-identical device state, so their draws can merge.
+    static bool sameState(const PolyParam& a, const PolyParam& b)
     {
-        for (const PolyParam& pp : polys)
+        return a.texture == b.texture
+            && a.tsp.full == b.tsp.full
+            && a.tcw.full == b.tcw.full
+            && a.pcw.Texture == b.pcw.Texture
+            && a.pcw.Offset  == b.pcw.Offset;
+    }
+
+    void drawList(std::vector<PolyParam>& polys, const std::vector<DrawRun>& runs)
+    {
+        for (const DrawRun& r : runs)
         {
-            if (pp.count < 3) continue;
-            if ((int)(pp.first + pp.count) > m_ni) continue;
-            applyPoly(pp);
+            applyPoly(polys[r.poly]);
             dev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,
-                                      0, m_nv, pp.first, pp.count - 2);
+                                      0, m_nv, r.first, r.idxCount - 2);
             ++g_stat_drawCalls;
+            g_stat_polys += r.nPolys;
         }
     }
 
@@ -556,6 +581,7 @@ struct XboxD3D8Renderer final : Renderer
             dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,
                                       0, m_nv, runFirst, runCount / 3);
             ++g_stat_drawCalls;
+            ++g_stat_polys;
             i = j;
         }
     }
@@ -637,6 +663,73 @@ struct XboxD3D8Renderer final : Renderer
             u32 idx = rc->idx[i];
             ip[i] = (u16)(idx < (u32)nv ? idx : 0u);
         }
+
+        // Merge consecutive same-state strips into single long strips in the
+        // IB region after the original indices, joined by degenerate bridges
+        // (repeat last index of A, repeat first index of B: 4 zero-area tris
+        // the GPU rejects for free). Reads come from rc->idx (cached RAM),
+        // never from ip[] -- the locked IB is write-combined memory and
+        // uncached reads of it would cost more than the merge saves. Winding
+        // parity across joins doesn't matter: CULLMODE is NONE.
+        {
+            u32 wcur = (u32)ni;
+            auto buildRuns = [&](std::vector<PolyParam>& polys, std::vector<DrawRun>& runs)
+            {
+                runs.clear();
+                const size_t n = polys.size();
+                size_t p = 0;
+                while (p < n)
+                {
+                    const PolyParam& pp = polys[p];
+                    if (pp.count < 3 || (int)(pp.first + pp.count) > ni)
+                    {
+                        ++p;    // invalid poly: skipped (as before batching)
+                        continue;
+                    }
+                    if (wcur + pp.count > (u32)MAX_TRI_I)
+                    {
+                        // Region full: draw this poly from the original strips.
+                        runs.push_back({pp.first, pp.count, (u32)p, 1});
+                        ++p;
+                        continue;
+                    }
+                    const u32 first = wcur;
+                    u16 lastIdx = 0;
+                    for (u32 k = 0; k < pp.count; ++k)
+                    {
+                        u32 v = rc->idx[pp.first + k];
+                        lastIdx = (u16)(v < (u32)nv ? v : 0u);
+                        ip[wcur++] = lastIdx;
+                    }
+                    u32 nPolys = 1;
+                    size_t q = p + 1;
+                    while (q < n)
+                    {
+                        const PolyParam& np = polys[q];
+                        if (np.count < 3 || (int)(np.first + np.count) > ni) break;
+                        if (!sameState(np, pp))                              break;
+                        if (wcur + np.count + 2 > (u32)MAX_TRI_I)            break;
+                        u32 b0 = rc->idx[np.first];
+                        ip[wcur++] = lastIdx;                       // bridge
+                        ip[wcur++] = (u16)(b0 < (u32)nv ? b0 : 0u); // bridge
+                        for (u32 k = 0; k < np.count; ++k)
+                        {
+                            u32 v = rc->idx[np.first + k];
+                            lastIdx = (u16)(v < (u32)nv ? v : 0u);
+                            ip[wcur++] = lastIdx;
+                        }
+                        ++nPolys;
+                        ++q;
+                    }
+                    runs.push_back({first, wcur - first, (u32)p, nPolys});
+                    p = q;
+                }
+            };
+            buildRuns(rc->global_param_op, runsOp);
+            buildRuns(rc->global_param_pt, runsPt);
+            if (rc->sortedTriangles.empty())
+                buildRuns(rc->global_param_tr, runsTr);
+        }
         ib->Unlock();
 
         m_nv = nv;
@@ -664,14 +757,14 @@ struct XboxD3D8Renderer final : Renderer
         dev->SetRenderState(D3DRS_ZWRITEENABLE,     TRUE);
         dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
         dev->SetRenderState(D3DRS_ALPHATESTENABLE,  FALSE);
-        drawList(rc->global_param_op);
+        drawList(rc->global_param_op, runsOp);
 
         // 2) Punch-through: write depth, alpha-test discards the transparent
         //    texels (1-bit alpha) so they don't occlude what's behind them.
         dev->SetRenderState(D3DRS_ALPHATESTENABLE,  TRUE);
         dev->SetRenderState(D3DRS_ALPHAREF,         0x80);
         dev->SetRenderState(D3DRS_ALPHAFUNC,        D3DCMP_GREATEREQUAL);
-        drawList(rc->global_param_pt);
+        drawList(rc->global_param_pt, runsPt);
         dev->SetRenderState(D3DRS_ALPHATESTENABLE,  FALSE);
 
         // 3) Translucent: test depth against the opaque/PT pass but DON'T write
@@ -684,7 +777,7 @@ struct XboxD3D8Renderer final : Renderer
         if (!rc->sortedTriangles.empty())
             drawSortedTr();
         else
-            drawList(rc->global_param_tr);
+            drawList(rc->global_param_tr, runsTr);
 
         return true;
     }

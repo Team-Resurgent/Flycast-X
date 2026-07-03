@@ -59,10 +59,26 @@ public:
 		{
 			FlushAllRegs(true);
 		}
+#if HOST_CPU == CPU_X86
+		// rec-x86 defers the MMU-exception context spill into the address-
+		// translation SLOW path (X86Compiler::genMmuLookup): dirty registers are
+		// written back only when the mmuAddressLUT misses -- the only path that
+		// can raise an SH4 exception. This keeps values in host registers across
+		// memory ops on the ~100% hit path instead of degrading the allocator to
+		// write-through around every readm/writem (measured as most of the 2x
+		// SH4 slowdown of WinCE/MMU games: MvC2, Sonic Adventure). shop_pref
+		// (store-queue writes) keeps the conservative flush: its exception path
+		// (do_sqw_mmu_no_ex) doesn't go through genMmuLookup.
+		else if (mmu_enabled() && op->op == shop_pref)
+		{
+			FlushAllRegs(false);
+		}
+#else
 		else if (mmu_enabled() && (op->op == shop_readm || op->op == shop_writem || op->op == shop_pref))
 		{
 			FlushAllRegs(false);
 		}
+#endif
 		else if (op->op == shop_sync_sr)
 		{
 			//FlushReg(reg_sr_T, true);
@@ -146,6 +162,11 @@ public:
 //				it->second.write_back = true;
 //			FlushReg(it->first, true);
 //		}
+
+		// This op's results are computed now -- everything still allocated holds
+		// a real guest value and is safe for the deferred MMU-exception spill.
+		for (auto& reg : reg_alloced)
+			reg.second.live = true;
 
 		// Final writebacks
 		if (op >= &block->oplist.back())
@@ -244,6 +265,22 @@ public:
 		return false;
 	}
 
+	// Deferred MMU-exception spill support: enumerate registers whose host reg
+	// holds a guest value newer than the context copy (dirty) AND actually valid
+	// (live -- excludes the current op's freshly allocated dest, whose host reg
+	// is garbage until the op writes it). rec-x86 emits stores for these inside
+	// the address-translation slow path, the only place an SH4 exception can be
+	// raised, so the context is architecturally correct at the throw point.
+	// Note this spills DIRTY regs regardless of write_back: a value that will be
+	// redefined later (write_back=false) is still the correct value NOW.
+	template<typename Fn>
+	void ForEachSpillableReg(Fn fn)
+	{
+		for (auto const& reg : reg_alloced)
+			if (reg.second.dirty && reg.second.live)
+				fn((u32)reg.first, reg.second.host_reg, IsFloat(reg.first));
+	}
+
 	void Cleanup() {
 		verify(final_opend || block->oplist.empty());
 		final_opend = false;
@@ -267,6 +304,11 @@ private:
 		u16 version;
 		bool write_back;
 		bool dirty;
+		// True once the host register actually holds the guest value. A freshly
+		// allocated DEST register is !live between OpBegin and OpEnd: its host
+		// reg contains garbage until the op writes it, so the deferred
+		// MMU-exception spill (ForEachSpillableReg) must not store it.
+		bool live;
 	};
 	static constexpr u32 MaxVecSize = AllocVec2 ? 2 : 1;
 
@@ -391,7 +433,7 @@ private:
 					host_reg = host_fregs.back();
 					host_fregs.pop_back();
 				}
-				reg_alloced[sh4reg] = { host_reg, param.version[i], false, false };
+				reg_alloced[sh4reg] = { host_reg, param.version[i], false, false, true /*live: preloaded below*/ };
 				if (!fast_forwarding)
 				{
 					if (IsFloat(sh4reg))
@@ -416,8 +458,16 @@ private:
 			shil_opcode* op = &block->oplist[i];
 			// if a subsequent op needs all or some regs flushed to mem
 			// TODO we could look at the ifb op to optimize what to flush
+#if HOST_CPU == CPU_X86
+			// readm/writem excluded: exception spills are deferred to the MMU
+			// slow path (see OpBegin) which stores DIRTY regs, not write_back
+			// ones, so exception correctness doesn't depend on this flag.
+			if (op->op == shop_ifb || (mmu_enabled() && op->op == shop_pref))
+				return true;
+#else
 			if (op->op == shop_ifb || (mmu_enabled() && (op->op == shop_readm || op->op == shop_writem || op->op == shop_pref)))
 				return true;
+#endif
 			if (op->op == shop_sync_sr && (/*reg == reg_sr_T ||*/ reg == reg_sr_status || (reg >= reg_r0 && reg <= reg_r7)
 					|| (reg >= reg_r0_Bank && reg <= reg_r7_Bank)))
 				return true;
@@ -469,7 +519,7 @@ private:
 					host_reg = host_fregs.back();
 					host_fregs.pop_back();
 				}
-				reg_alloced[sh4reg] = { host_reg, param.version[i], NeedsWriteBack(sh4reg, param.version[i]), true };
+				reg_alloced[sh4reg] = { host_reg, param.version[i], NeedsWriteBack(sh4reg, param.version[i]), true, false /*live at OpEnd*/ };
 				if (param.is_r32i())
 					ssa_printf("   %s.%d -> %cx %s", name_reg(sh4reg).c_str(), param.version[i], 'a' + host_reg, reg_alloced[sh4reg].write_back ? "(wb)" : "");
 				else

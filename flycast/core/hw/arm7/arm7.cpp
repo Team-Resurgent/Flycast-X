@@ -363,8 +363,11 @@ namespace recompiler {
 
 //Emulate a single arm op, passed in opcode
 
+extern "C" volatile unsigned g_arm_fallbacks;   // profiler: JIT->interpreter fallbacks/frame
+
 void DYNACALL interpret(u32 opcode)
 {
+	g_arm_fallbacks++;
 	u32 clockTicks = 0;
 
 #define NO_OPCODE_READ

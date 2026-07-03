@@ -190,11 +190,35 @@ bool mmu_match(u32 va, CCN_PTEH_type Address, CCN_PTEL_type Data)
 
 #ifndef FAST_MMU
 //Do a full lookup on the UTLB entry's
+// Last-hit UTLB cache: code/data locality means block dispatch (the hot caller,
+// via bm_GetCodeByVAddr -> mmu_instruction_translation -> here) very often
+// re-requests the SAME translation it just used (loops, tight functions).
+// Re-checking that ONE entry via the exact same mmu_match() the full scan uses
+// is exactly as safe as any single loop iteration -- a stale/repurposed entry
+// (invalidated, ASID switched, etc.) simply fails mmu_match() and falls
+// through to the unchanged 64-entry scan below, same as a cache miss.
+// Trade-off (accepted): a cache HIT skips scanning the other 63 entries, so it
+// won't detect a TLB_MHIT (overlapping/corrupt TLB) that the full scan would --
+// real guest OSes don't intentionally create overlapping entries, so this
+// never fires in practice; a genuinely corrupt TLB is an existing guest bug
+// either way, just undetected on the lucky cache-hit call instead of a normal
+// scan. Correctness of an actual hit is unaffected: same mmu_match(), same rv.
+static const TLB_Entry* s_lastTlbHit = nullptr;
+
 MmuError mmu_full_lookup(u32 va, const TLB_Entry** tlb_entry_ret, u32& rv)
 {
 	CCN_MMUCR.URC++;
 	if (CCN_MMUCR.URB == CCN_MMUCR.URC)
 		CCN_MMUCR.URC = 0;
+
+	if (s_lastTlbHit != nullptr && mmu_match(va, s_lastTlbHit->Address, s_lastTlbHit->Data))
+	{
+		*tlb_entry_ret = s_lastTlbHit;
+		u32 sz = s_lastTlbHit->Data.SZ1 * 2 + s_lastTlbHit->Data.SZ0;
+		u32 mask = mmu_mask[sz];
+		rv = ((s_lastTlbHit->Data.PPN << 10) & mask) | (va & ~mask);
+		return MmuError::NONE;
+	}
 
 	*tlb_entry_ret = nullptr;
 	for (const TLB_Entry& tlb_entry : UTLB)
@@ -213,8 +237,9 @@ MmuError mmu_full_lookup(u32 va, const TLB_Entry** tlb_entry_ret, u32& rv)
 
 	if (*tlb_entry_ret == nullptr)
 		return MmuError::TLB_MISS;
-	else
-		return MmuError::NONE;
+
+	s_lastTlbHit = *tlb_entry_ret;
+	return MmuError::NONE;
 }
 
 //Simple QACR translation for mmu (when AT is off)
@@ -271,9 +296,21 @@ MmuError mmu_full_SQ(u32 va, u32& rv)
 template MmuError mmu_full_SQ<MMU_TT_DREAD>(u32 va, u32& rv);
 template MmuError mmu_full_SQ<MMU_TT_DWRITE>(u32 va, u32& rv);
 
+// Direct profiler for the MMU data-translation path (the suspected real cost
+// driver for WinCE games, now that the TLB last-hit cache showed no measurable
+// change -- rather than guess again, measure directly). Xbox port only.
+// Globals defined in main_xbox.cpp (same pattern as g_prof_arm_cyc/aica_cyc).
+#include <intrin.h>
+extern "C" volatile long long g_prof_mmu_cyc;
+extern "C" volatile unsigned  g_prof_mmu_calls;
+extern "C" volatile unsigned  g_prof_mmu_slow;
+
 template<u32 translation_type>
 MmuError mmu_data_translation(u32 va, u32& rv)
 {
+	unsigned long long _mmuT0 = __rdtsc();
+	struct _MmuAcc { unsigned long long t0; ~_MmuAcc(){ g_prof_mmu_cyc += (long long)(__rdtsc() - t0); ++g_prof_mmu_calls; } } _mmuAcc{_mmuT0};
+
 	if (translation_type == MMU_TT_DWRITE)
 	{
 		if ((va & 0xFC000000) == 0xE0000000)
@@ -305,6 +342,7 @@ MmuError mmu_data_translation(u32 va, u32& rv)
 		return MmuError::NONE;
 	}
 
+	++g_prof_mmu_slow;
 	const TLB_Entry *entry;
 	MmuError lookup = mmu_full_lookup(va, &entry, rv);
 

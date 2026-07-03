@@ -26,6 +26,7 @@
 #include "hw/aica/aica_if.h"
 #include "oslib/virtmem.h"
 #include "arm_mem.h"
+#include <intrin.h>		// __rdtsc (component profiler)
 
 #if 0
 // for debug
@@ -42,6 +43,10 @@ namespace aica::arm
 void (*arm_compilecode)();
 arm_mainloop_t arm_mainloop;
 extern u8 cpuBitsSet[256];
+
+// Sampling-profiler range (defined in the Xbox port's main_xbox.cpp).
+extern "C" u8 *g_arm7CacheStart;
+extern "C" u32 g_arm7CacheSize;
 
 namespace recompiler {
 
@@ -670,6 +675,10 @@ void init()
 #endif
 	verify(rc);
 
+	// Sampling-profiler range (defined in the Xbox port's main_xbox.cpp).
+	g_arm7CacheStart = ICache;
+	g_arm7CacheSize = ICacheSize;
+
 	flush();
 }
 
@@ -730,6 +739,11 @@ void *getMemOp(bool Load, bool Byte)
 
 // Run a timeslice of arm7
 
+// Component profiler (main_xbox): arm = the ARM7 JIT mainloop only; aica =
+// timeStep (AICA sample gen + per-sample interrupt/timer updates).
+extern "C" volatile long long g_prof_arm_cyc;
+extern "C" volatile long long g_prof_aica_cyc;
+
 void run(u32 samples)
 {
 	for (u32 i = 0; i < samples; i++)
@@ -737,9 +751,13 @@ void run(u32 samples)
 		if (Arm7Enabled)
 		{
 			arm_Reg[CYCL_CNT].I += ARM_CYCLES_PER_SAMPLE;
+			unsigned long long _t = __rdtsc();
 			arm_mainloop(arm_Reg, recompiler::EntryPoints);
+			g_prof_arm_cyc += (long long)(__rdtsc() - _t);
 		}
+		unsigned long long _t2 = __rdtsc();
 		timeStep();
+		g_prof_aica_cyc += (long long)(__rdtsc() - _t2);
 	}
 }
 

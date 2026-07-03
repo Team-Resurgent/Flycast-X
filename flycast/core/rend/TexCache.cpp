@@ -28,6 +28,11 @@
 
 extern bool pal_needs_update;
 
+// Set by the platform layer (1 = free RAM is low) to make BaseTextureCache::
+// CollectCleanup evict the texture cache aggressively. Bounds memory on the 64MB
+// Xbox where SA1/MvC2 stream more textures than the heap can hold. Default 0.
+volatile int textureMemPressure = 0;
+
 // Rough approximation of LoD bias from D adjust param, only used to increase LoD
 const std::array<f32, 16> D_Adjust_LoD_Bias = {
 		0.f, -4.f, -2.f, -1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f

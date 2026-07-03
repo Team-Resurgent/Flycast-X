@@ -24,6 +24,17 @@ static u8* CodeCache;
 static u8* TempCodeCache;
 ptrdiff_t cc_rx_offset;
 
+// Sampling-profiler range (defined in the Xbox port's main_xbox.cpp).
+extern "C" u8 *g_sh4CacheStart;
+extern "C" u32 g_sh4CacheSize;
+
+// Link diagnostics (defined in main_xbox.cpp): the MMU linking build measured
+// SLOWER than no linking, which is only possible if edges are stuck on the stub
+// path (every execution = a full rdv_LinkBlock C call). Count what happens.
+extern "C" unsigned g_cnt_linkStub;    // rdv_LinkBlock invocations
+extern "C" unsigned g_cnt_linkWired;   // links persisted (edge becomes a direct jmp)
+extern "C" unsigned g_cnt_linkRej;     // persistence rejected by the MMU identity gate
+
 static std::unordered_set<u32> smc_hotspots;
 
 static Sh4CodeBuffer codeBuffer;
@@ -185,6 +196,15 @@ static DynarecCodeEntryPtr compilePC(u32 blockcheck_failures)
 
 	bm_AddBlock(rbi);
 
+	// The shil op list is only consumed during decode/optimize/compile (decoder,
+	// ssa, regalloc); nothing reads it at runtime -- Relink() and the rewriters
+	// use only the scalar block fields. Retaining it leaked ~1KB+ per block:
+	// MEMSTAT proved textures innocent (tex<=2.5MB) while ~22k live blocks
+	// tracked freeMB's 27MB slide to zero almost exactly. Free it for real
+	// (clear() alone keeps the capacity).
+	rbi->oplist.clear();
+	rbi->oplist.shrink_to_fit();
+
 	codeBuffer.useTempBuffer(false);
 
 	return rbi->code;
@@ -296,10 +316,42 @@ void* DYNACALL rdv_LinkBlock(u8* code,u32 dpc)
 			Sh4cntx.pc = rbi->NextBlock;
 	}
 
+	g_cnt_linkStub++;
+	const u32 linkTargetPc = Sh4cntx.pc;
 	DynarecCodeEntryPtr rv = findOrCompile();  // Returns rx ptr
 
 	if (mmu_enabled())
-		return (void *)rv;
+	{
+		// MMU block linking is persisted ONLY between identity-mapped vaddrs
+		// (P1/P2/P4, fast_reg_lut nonzero): the SH4 architecture fixes their
+		// translation, so a vaddr->block link can never be invalidated by a TLB
+		// change. Everything else -- user-space targets, odd syscall-trap pcs
+		// (WinCE HLE, must re-run through bm_GetCodeByVAddr every time), or an
+		// FPCB slot occupied by a block aliased from a DIFFERENT vaddr -- keeps
+		// the old behavior: resolve this jump now, never persist a link.
+		//
+		// CRITICAL (found the hard way -- the first linking build was SLOWER):
+		// Sh4cntx.pc must be re-checked against the pc we ASKED for. When the
+		// static target is an HLE syscall trap, bm_GetCodeByVAddr (inside
+		// findOrCompile) EXECUTES the syscall and rewrites Sh4cntx.pc to the
+		// return address -- even/identity, so it sailed through this gate, then
+		// the wiring below matched neither BranchBlock nor NextBlock: no link
+		// was ever made, but AddRef leaked a referrer and Relink() re-emitted
+		// the block ON EVERY EXECUTION of every syscall edge. WinCE games call
+		// GetTickCount constantly.
+		RuntimeBlockInfoPtr nxt = stale_block ? nullptr : bm_GetBlock(Sh4cntx.pc);
+		if (stale_block
+				|| Sh4cntx.pc != linkTargetPc
+				|| fast_reg_lut[rbi->vaddr >> 29] == 0
+				|| fast_reg_lut[Sh4cntx.pc >> 29] == 0
+				|| (Sh4cntx.pc & 1) != 0
+				|| !nxt || nxt->vaddr != Sh4cntx.pc)
+		{
+			g_cnt_linkRej++;
+			return (void *)rv;
+		}
+		g_cnt_linkWired++;
+	}
 	if (!stale_block)
 	{
 		if (bcls == BET_CLS_Dynamic)
@@ -368,6 +420,11 @@ void Sh4Recompiler::Init()
 	verify(rc);
 	// Ensure the pointer returned is non-null
 	verify(CodeCache != nullptr);
+
+	// Sampling-profiler range (defined in the Xbox port's main_xbox.cpp): lets
+	// the EIP sampler classify "inside SH4 JIT cache" vs C code.
+	g_sh4CacheStart = CodeCache;
+	g_sh4CacheSize = FULL_SIZE;
 
 	TempCodeCache = CodeCache + CODE_SIZE;
 	sh4Dynarec->init(*getContext(), codeBuffer);

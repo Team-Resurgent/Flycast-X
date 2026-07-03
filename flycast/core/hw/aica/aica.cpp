@@ -84,9 +84,16 @@ AicaTimer timers[3];
 int aica_schid = -1;
 constexpr int AICA_TICK = 4535;		// 44.1 KHz
 
+// Component profiler (defined in the Xbox port). rdtsc is a compiler intrinsic.
+#include <intrin.h>
+extern "C" volatile long long g_prof_arm_cyc;
+extern "C" volatile long long g_prof_aica_cyc;
+
 static int AicaUpdate(int tag, int cycles, int jitter, void *arg)
 {
-	arm::run(1);
+	unsigned long long _t = __rdtsc();
+	arm::run(1);				// ARM7 sound CPU + per-sample timeStep (profiled)
+	g_prof_arm_cyc += (long long)(__rdtsc() - _t);
 
 	return AICA_TICK;
 }
@@ -101,7 +108,7 @@ void timeStep()
 	SCIPD->SAMPLE_DONE = 1;
 	MCIPD->SAMPLE_DONE = 1;
 
-	sgc::AICA_Sample();
+	sgc::AICA_Sample();			// (timeStep as a whole is profiled in arm7_rec.cpp run())
 
 	//Make sure sh4/arm interrupt system is up to date
 	update_arm_interrupts();

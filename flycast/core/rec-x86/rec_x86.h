@@ -71,6 +71,7 @@ public:
 	void genMainloop();
 	u32 relinkBlock(RuntimeBlockInfo *block);
 	bool rewriteMemAccess(host_context_t &context);
+	bool rewriteInlineMemAccess(host_context_t &context);
 
 	static void (*handleException)();
 
@@ -79,6 +80,7 @@ private:
 
 	bool genReadMemImmediate(const shil_opcode& op, RuntimeBlockInfo *block);
 	bool genWriteMemImmediate(const shil_opcode& op, RuntimeBlockInfo *block);
+	bool genInlineFastMem(int memOpSize, u32 memOp);
 	void genMemHandlers();
 	void alignStack(int amount);
 	void genMmuLookup(RuntimeBlockInfo* block, const shil_opcode& op, u32 write);

@@ -117,6 +117,14 @@ class XboxDirectSoundBackend : public AudioBackend
 
 	ByteFifo            fifo;
 
+	// Declick state for underruns (see feederMain): a hard cut to/from silence
+	// is itself an audible click, and at sub-realtime speed it happens often
+	// enough to sound like continuous crackling. Ramp instead.
+	s16  lastL = 0, lastR = 0;   // last real sample written (fade-out start point)
+	bool wasSilent = true;      // true at startup too -- fades the very first
+	                            // audio in instead of starting with a pop.
+	static const u32 kFadeFrames = 48;   // ~1.1ms @ 44100Hz
+
 	static DWORD WINAPI feederTrampoline(LPVOID self)
 	{
 		((XboxDirectSoundBackend *)self)->feederMain();
@@ -150,8 +158,56 @@ class XboxDirectSoundBackend : public AudioBackend
 				u32 got = fifo.read(scratch, chunk);
 				if (got > 0)
 					drained = true;
+
+				s16* samples = (s16*)scratch;
+				u32 chunkFrames = chunk / FRAME_BYTES;
+				u32 gotFrames = got / FRAME_BYTES;
+
 				if (got < chunk)
-					memset(scratch + got, 0, chunk - got);
+				{
+					// Underrun. A hard cut to silence is a waveform discontinuity
+					// -- audible as a click/pop -- and at sub-realtime speed this
+					// fires often enough to sound like continuous crackling.
+					// Ramp the tail down from the last real sample instead, then
+					// hold true silence for the remainder.
+					u32 gapFrames = chunkFrames - gotFrames;
+					u32 fadeFrames = (gapFrames < kFadeFrames) ? gapFrames : kFadeFrames;
+					s16 fromL = (gotFrames > 0) ? samples[(gotFrames - 1) * 2 + 0] : lastL;
+					s16 fromR = (gotFrames > 0) ? samples[(gotFrames - 1) * 2 + 1] : lastR;
+					for (u32 i = 0; i < fadeFrames; i++)
+					{
+						float t = 1.0f - (float)(i + 1) / (float)(fadeFrames + 1);   // 1 -> 0
+						samples[(gotFrames + i) * 2 + 0] = (s16)(fromL * t);
+						samples[(gotFrames + i) * 2 + 1] = (s16)(fromR * t);
+					}
+					u32 silenceStart = (gotFrames + fadeFrames) * FRAME_BYTES;
+					if (silenceStart < chunk)
+						memset(scratch + silenceStart, 0, chunk - silenceStart);
+					lastL = lastR = 0;
+					wasSilent = true;
+				}
+				else
+				{
+					// Full real chunk. Coming out of an underrun? Fade IN from
+					// silence over a short ramp instead of popping straight to
+					// full volume (also smooths the very first chunk at startup).
+					if (wasSilent)
+					{
+						u32 fadeFrames = (chunkFrames < kFadeFrames) ? chunkFrames : kFadeFrames;
+						for (u32 i = 0; i < fadeFrames; i++)
+						{
+							float t = (float)(i + 1) / (float)(fadeFrames + 1);   // 0 -> 1
+							samples[i * 2 + 0] = (s16)(samples[i * 2 + 0] * t);
+							samples[i * 2 + 1] = (s16)(samples[i * 2 + 1] * t);
+						}
+						wasSilent = false;
+					}
+					if (chunkFrames > 0)
+					{
+						lastL = samples[(chunkFrames - 1) * 2 + 0];
+						lastR = samples[(chunkFrames - 1) * 2 + 1];
+					}
+				}
 
 				void *p1 = nullptr, *p2 = nullptr;
 				DWORD s1 = 0, s2 = 0;

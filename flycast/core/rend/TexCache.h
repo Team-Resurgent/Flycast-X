@@ -88,6 +88,7 @@ public:
 	u32 startAddress;	// texture data start address in vram
 
 	u32 dirty;			// frame number at which texture was overwritten
+	u32 lastUsedFrame = 0;	// frame number at which texture was last looked up (LRU eviction)
 	vram_block* lock_block;
 
 	u32 mmStartAddress; // pixel data start address of max level mipmap
@@ -214,6 +215,7 @@ public:
 			texture = &cache.emplace(std::make_pair(key, Texture(tsp, tcw, area))).first->second;
 		}
 
+		texture->lastUsedFrame = FrameCount;	// LRU stamp (see CollectCleanup)
 		return texture;
 	}
 
@@ -243,16 +245,31 @@ public:
 
 	void CollectCleanup()
 	{
-		std::vector<u64> list;
+		// LRU eviction, adaptive to free RAM. The old dirty-only rule let static
+		// (never-invalidated) textures accumulate until OOM on the 64MB Xbox -- SA1
+		// streams a whole level's worth. We also evict textures not drawn (looked
+		// up) in the last N frames. The platform sets textureMemPressure (1 = low
+		// free RAM) from its free-memory watch: under pressure we shrink the keep-
+		// window and evict far more per call so memory stays bounded; otherwise we
+		// keep textures ~10-20s to avoid re-upload churn. On-screen textures are
+		// looked up every frame they draw, so even the tight window never evicts
+		// something still visible.
+		extern volatile int textureMemPressure;
+		const bool hard = textureMemPressure != 0;
+		const u32 lruFrames = hard ? 60u : 600u;
+		const u32 maxEvict  = hard ? 64u : 16u;
 
-		u32 TargetFrame = std::max((u32)120, FrameCount) - 120;
+		std::vector<u64> list;
+		u32 DirtyTarget = std::max((u32)120, FrameCount) - 120;
+		u32 LruTarget   = std::max(lruFrames, FrameCount) - lruFrames;
 
 		for (const auto& [id, texture] : cache)
 		{
-			if (texture.dirty && texture.dirty < TargetFrame)
+			if ((texture.dirty && texture.dirty < DirtyTarget)
+				|| (texture.lastUsedFrame != 0 && texture.lastUsedFrame < LruTarget))
 				list.push_back(id);
 
-			if (list.size() > 5)
+			if (list.size() > maxEvict)
 				break;
 		}
 

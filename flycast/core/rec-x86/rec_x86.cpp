@@ -40,6 +40,24 @@ static void (*ngen_blockcheckfail)();
 void (*X86Compiler::handleException)();
 
 static Xbyak::Operand::Code alloc_regs[] {  Xbyak::Operand::EBX,  Xbyak::Operand::EBP,  Xbyak::Operand::ESI,  Xbyak::Operand::EDI, (Xbyak::Operand::Code)-1 };
+
+// Execution-shape counter (defined in main_xbox.cpp): block entries, bumped by
+// an `inc` emitted in every block prologue. kJitCounters gates EMISSION (a C++
+// compile-time constant folded at codegen time): false = zero runtime cost.
+static const bool kJitCounters = false;
+extern "C" unsigned g_cnt_block;
+// Code-region markers (defined in main_xbox.cpp, assigned by driver.cpp /
+// genMemHandlers): used by rewrite() to tell an INLINE fastmem fault (pc inside
+// a block body) from a handler fastmem fault (pc inside the generated handlers).
+extern "C" u8 *g_sh4CacheStart;
+extern "C" u32 g_sh4CacheSize;
+extern "C" const u8 *g_memHandlerStart, *g_memHandlerEnd;
+// COMPILE-time emission counters (bumped by the compiler, not emitted code):
+// which relinkBlock branch each block-exit actually got. Diagnoses why
+// link/win wired stays 0 (suspicion: gameplay blocks compile with mmu OFF).
+extern "C" unsigned g_cnt_emitMmuLink;   // mmu identity-linked exit emitted
+extern "C" unsigned g_cnt_emitMmuNoUpd;  // mmu no_update (unlinkable) exit emitted
+extern "C" unsigned g_cnt_emitNonMmu;    // non-mmu linkable exit emitted
 static s8 alloc_fregs[] = { 7, 6, 5, 4, -1 };
 alignas(16) static f32 thaw_regs[4];
 UnwindInfo unwinder;
@@ -122,6 +140,10 @@ void X86Compiler::compile(RuntimeBlockInfo* block, bool force_checks, bool optim
 		L(fpu_enabled);
 	}
 
+	// Execution-shape counter (defined in main_xbox.cpp): block entries/frame.
+	// Diagnostic builds only -- ~350k emitted incs/frame cost ~1ms at 733MHz.
+	if (kJitCounters)
+		inc(dword[&g_cnt_block]);
 	mov(eax, dword[&sh4ctx.cycle_counter]);
 	test(eax, eax);
 	Xbyak::Label no_up;
@@ -231,13 +253,62 @@ u32 X86Compiler::relinkBlock(RuntimeBlockInfo* block)
 
 		if (mmu_enabled())
 		{
-			mov(ecx, block->BranchBlock);
-			mov(eax, block->NextBlock);
-			cmovne(ecx, eax);
-			jmp((const void *)no_update);
+			// MMU block linking, identity regions only: P1/P2/P4 vaddrs
+			// (fast_reg_lut nonzero) never translate -- the SH4 architecture
+			// fixes their mapping -- so a static branch between them links
+			// exactly like the non-MMU case. Counters showed ~350k block
+			// dispatches/frame in WinCE games (avg block ~6 instrs), each
+			// paying the full no_update dispatch; a linked exit pays one pc
+			// store + direct jmp. The pc store is required because the target
+			// block's entry check compares sh4ctx.pc to its vaddr
+			// (checkBlock). Stub call and direct jmp are both 5 bytes and the
+			// movs are unconditional, so Relink() re-emissions and the initial
+			// emission are byte-for-byte size-stable, as the relink machinery
+			// requires.
+			if (fast_reg_lut[block->BranchBlock >> 29] != 0
+					&& fast_reg_lut[block->NextBlock >> 29] != 0)
+			{
+				g_cnt_emitMmuLink++;
+				Xbyak::Label noBranch;
+
+				jne(noBranch);
+				{
+					//branch block
+					mov(dword[&sh4ctx.pc], block->BranchBlock);
+					if (block->pBranchBlock)
+						jmp((const void *)block->pBranchBlock->code, T_NEAR);
+					else
+						call(ngen_LinkBlock_cond_Branch_stub);
+				}
+				L(noBranch);
+				{
+					//no branch block
+					mov(dword[&sh4ctx.pc], block->NextBlock);
+					if (block->pNextBlock)
+						jmp((const void *)block->pNextBlock->code, T_NEAR);
+					else
+						call(ngen_LinkBlock_cond_Next_stub);
+				}
+				nop();
+				nop();
+				nop();
+				nop();
+				nop();
+				nop();
+			}
+			else
+			{
+				// Non-identity target (user space): unlinkable, full dispatch.
+				g_cnt_emitMmuNoUpd++;
+				mov(ecx, block->BranchBlock);
+				mov(eax, block->NextBlock);
+				cmovne(ecx, eax);
+				jmp((const void *)no_update);
+			}
 		}
 		else
 		{
+			g_cnt_emitNonMmu++;
 			Xbyak::Label noBranch;
 
 			jne(noBranch);
@@ -278,6 +349,24 @@ u32 X86Compiler::relinkBlock(RuntimeBlockInfo* block)
 	case BET_StaticJump:
 		if (!mmu_enabled())
 		{
+			if (block->pBranchBlock)
+				jmp((const void *)block->pBranchBlock->code, T_NEAR);
+			else
+				call(ngen_LinkBlock_Generic_stub);
+			nop();
+			nop();
+			nop();
+			nop();
+			nop();
+		}
+		else if (fast_reg_lut[block->BranchBlock >> 29] != 0)
+		{
+			// MMU identity-region link -- see the BET_Cond comment above. The
+			// pc store satisfies the target's entry check; odd syscall-trap
+			// targets never persist a link (rdv_LinkBlock's gate), so they
+			// keep resolving through the stub each time, which is what runs
+			// the WinCE HLE syscalls.
+			mov(dword[&sh4ctx.pc], block->BranchBlock);
 			if (block->pBranchBlock)
 				jmp((const void *)block->pBranchBlock->code, T_NEAR);
 			else
@@ -467,6 +556,29 @@ void X86Compiler::genMainloop()
 	else
 	{
 		mov(dword[&sh4ctx.pc], ecx);
+		// Under full MMU, block linking is off, so EVERY block transition comes
+		// through here -- and it used to always pay a C call. Inline the common
+		// case: an even pc in an identity-mapped region (P1/P2/P4, fast_reg_lut
+		// nonzero -- WinCE kernel+game code runs from P1) needs no translation
+		// and can take the exact FPCB table jump the non-MMU dispatch uses.
+		// bm_GetCodeByVAddr computes the same thing for these addresses: identity
+		// paddr, then FPCA masks with RAM_SIZE_MAX-2 -- same slot, same aliasing
+		// semantics, same per-block check as before. Odd pcs (WinCE HLE syscall
+		// traps like GetTickCount at 0xfffffde7) and translated regions (P0/U0/
+		// P3) still take the C path. An empty FPCB slot jumps to
+		// ngen_FailedToFindBlock_, which under MMU reads sh4ctx.pc -- stored
+		// above -- so both paths feed it correctly.
+		Xbyak::Label slowDispatch;
+		test(cl, 1);
+		jnz(slowDispatch);
+		mov(eax, ecx);
+		shr(eax, 29);
+		cmp(dword[(uintptr_t)fast_reg_lut + eax * 4], 0);
+		je(slowDispatch);
+		mov(eax, (uintptr_t)&sh4ctx + sizeof(Sh4Context) - sizeof(Sh4RCB) + offsetof(Sh4RCB, fpcb));	// address of fpcb[0]
+		and_(ecx, RAM_SIZE_MAX - 2);
+		jmp(dword[eax + ecx * 2]);
+		L(slowDispatch);
 		call((void *)bm_GetCodeByVAddr);
 		jmp(eax);
 	}
@@ -941,6 +1053,24 @@ public:
 		if (codeBuffer == nullptr)
 			// init() not called yet
 			return false;
+		// Inline fastmem fault: the faulting pc is inside the SH4 code cache but
+		// OUTSIDE the generated memory handlers -- the access was emitted inline
+		// into the block (genInlineFastMem). Every inline variant has an 8-byte
+		// mov/and prefix, so the sequence starts at pc-8; rewriteInlineMemAccess
+		// validates the bytes before patching anything.
+		if (g_sh4CacheStart != nullptr
+				&& context.pc >= (uintptr_t)g_sh4CacheStart
+				&& context.pc <  (uintptr_t)g_sh4CacheStart + g_sh4CacheSize
+				&& !(context.pc >= (uintptr_t)g_memHandlerStart
+						&& context.pc < (uintptr_t)g_memHandlerEnd))
+		{
+			u8 *rewriteAddr = (u8 *)context.pc - 8;
+			X86Compiler *compiler = new X86Compiler(*sh4ctx, *codeBuffer, rewriteAddr);
+			bool rv = compiler->rewriteInlineMemAccess(context);
+			delete compiler;
+
+			return rv;
+		}
 		u8 *rewriteAddr = *(u8 **)context.esp - 5;
 		X86Compiler *compiler = new X86Compiler(*sh4ctx, *codeBuffer, rewriteAddr);
 		bool rv = compiler->rewriteMemAccess(context);

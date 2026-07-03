@@ -14,6 +14,7 @@
 
 #include <xtl.h>
 #include <XGraphics.h>
+#include <intrin.h>      // __rdtsc (texture-upload profiler)
 #ifdef min
 #  undef min
 #endif
@@ -34,6 +35,20 @@ static u32 g_palGen = 1;
 // session. main_xbox.cpp samples the delta every 60 frames to split render cost
 // from emulation cost. Defined here, read via extern in main.
 volatile long long g_renderUs = 0;
+extern "C" volatile long long g_prof_tex_cyc;   // texture-upload profiler (defined in main_xbox)
+
+// Render diagnostics: figure out what "rend" cost is actually bound by (call
+// count vs vertex/index throughput) instead of guessing. main_xbox.cpp samples
+// deltas every 60 frames.
+extern "C" {
+volatile unsigned g_stat_drawCalls  = 0;   // DrawIndexedPrimitive calls
+volatile unsigned g_stat_stateCalls = 0;   // actual Set*() calls issued (post-cache)
+volatile unsigned g_stat_stateSkipped = 0; // Set*() calls the cache skipped
+volatile unsigned g_stat_verts      = 0;   // rc->verts.size() (clamped) per frame
+volatile unsigned g_stat_idx        = 0;   // rc->idx.size() (clamped) per frame
+volatile unsigned g_stat_polys      = 0;   // total PolyParam entries processed per frame
+unsigned g_stat_vbLockUs            = 0;   // us spent blocked in VB/IB Lock (GPU-sync stalls)
+}
 static inline long long qpcNow()
 {
     LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart;
@@ -134,6 +149,11 @@ static D3DPalette* GetXboxPalette(u32 off)
 //  NV2A mis-samples 16-bit swizzled formats — expand everything to A8R8G8B8
 //  then XGSwizzleRect so the GPU samples correctly. Paletted textures stay P8.
 // ---------------------------------------------------------------------------
+// Texture-cache accounting (read by main_xbox for the byte-budget eviction and
+// the MEMSTAT line): bytes of committed D3D texture memory + live texture count.
+extern "C" unsigned g_texCacheBytes = 0;
+extern "C" unsigned g_texCacheCount = 0;
+
 class XboxTex final : public BaseTextureCacheData
 {
 public:
@@ -141,21 +161,40 @@ public:
     // (_8) textures it is a native P8 index texture (1 byte/pixel) whose colours
     // come from a hardware palette bound per-draw -- see GetXboxPalette / applyPoly.
     IDirect3DTexture8* d3dtex = nullptr;
+    u32 texBytes = 0;   // committed size, for the byte-budget accounting
 
     XboxTex(TSP tsp={}, TCW tcw={}, int area=0) : BaseTextureCacheData(tsp, tcw, area) {}
     XboxTex(XboxTex&& o) : BaseTextureCacheData(std::move(o))
     {
         std::swap(d3dtex, o.d3dtex);
+        std::swap(texBytes, o.texBytes);
     }
 
     std::string GetId() override { return std::to_string((uintptr_t)d3dtex); }
 
+    bool createTex(int w, int h, D3DFORMAT fmt, u32 bpp)
+    {
+        if (d3dtex)
+            return true;
+        if (FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0, fmt, D3DPOOL_DEFAULT, &d3dtex)))
+        {
+            // Out of memory: signal the byte-budget eviction to clear room; this
+            // texture just doesn't draw this frame and retries on next lookup.
+            extern volatile int textureMemPressure;
+            textureMemPressure = 1;
+            d3dtex = nullptr;
+            return false;
+        }
+        texBytes = (u32)w * (u32)h * bpp;
+        g_texCacheBytes += texBytes;
+        g_texCacheCount++;
+        return true;
+    }
+
     // CreateTexture (lazily) + swizzle a finished A8R8G8B8 buffer into it.
     void commitPx(const u32* px, int w, int h)
     {
-        if (!d3dtex
-            && FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
-                          D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &d3dtex)))
+        if (!createTex(w, h, D3DFMT_A8R8G8B8, 4))
             return;
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
@@ -165,8 +204,24 @@ public:
         }
     }
 
+    // Native 16-bit commit -- half the VRAM of expanding to A8R8G8B8. DC's
+    // 565/1555/4444 layouts match D3DFMT_R5G6B5/A1R5G5B5/A4R4G4B4 bit-for-bit
+    // (SetDirectXColorOrder), so this is a straight 2-byte swizzle, no conversion.
+    void commitPx16(const void* px, int w, int h, D3DFORMAT fmt)
+    {
+        if (!createTex(w, h, fmt, 2))
+            return;
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
+        {
+            XGSwizzleRect((void*)px, w * 2, NULL, lr.pBits, w, h, NULL, 2); // 2 bytes/px
+            d3dtex->UnlockRect(0);
+        }
+    }
+
     void UploadToGPU(int w, int h, const u8* src, bool, bool) override
     {
+        struct _TexT { unsigned long long t0; ~_TexT(){ g_prof_tex_cyc += (long long)(__rdtsc() - t0); } } _texT{ __rdtsc() };
         const int n = w * h;
 
         // Paletted (PAL4/PAL8) textures reach us as palette INDICES (_8 /
@@ -178,9 +233,7 @@ public:
         // exactly what the NV2A's paletted-texture path is for.
         if (tex_type == TextureType::_8)
         {
-            if (!d3dtex
-                && FAILED(g_xbox_d3d_dev->CreateTexture(w, h, 1, 0,
-                              D3DFMT_P8, D3DPOOL_DEFAULT, &d3dtex)))
+            if (!createTex(w, h, D3DFMT_P8, 1))
                 return;
             D3DLOCKED_RECT lr;
             if (SUCCEEDED(d3dtex->LockRect(0, &lr, NULL, 0)))
@@ -191,62 +244,32 @@ public:
             return;
         }
 
-        u32* px = (u32*)malloc(n * 4);
-        if (!px) return;
-
-        const u16* s = (const u16*)src;
+        // Keep DC 16-bit textures NATIVE 16-bit (half the VRAM of expanding to
+        // A8R8G8B8) -- decisive for big WinCE games (SA1) that otherwise exhaust
+        // the 64MB Xbox. Layouts match D3D 16-bit formats 1:1 so it's a straight
+        // swizzle. Only true 32-bit (_8888) stays A8R8G8B8.
+        (void)n;
         switch (tex_type)
         {
-        case TextureType::_565:
-            for (int i = 0; i < n; ++i)
-            {
-                u32 t = s[i];
-                px[i] = 0xff000000u
-                      | (((t >> 11) & 31) * 255 / 31 << 16)
-                      | (((t >>  5) & 63) * 255 / 63 <<  8)
-                      | (( t        & 31) * 255 / 31);
-            }
-            break;
-
-        case TextureType::_5551:
-            for (int i = 0; i < n; ++i)
-            {
-                u32 t = s[i];
-                px[i] = ((t >> 15 & 1) ? 0xff000000u : 0u)
-                      | ((t >> 10 & 31) * 255 / 31 << 16)
-                      | ((t >>  5 & 31) * 255 / 31 <<  8)
-                      | (( t      & 31) * 255 / 31);
-            }
-            break;
-
-        case TextureType::_4444:
-            for (int i = 0; i < n; ++i)
-            {
-                u32 t = s[i];
-                px[i] = ((t >> 12 & 15) * 17u << 24)
-                      | ((t >>  8 & 15) * 17u << 16)
-                      | ((t >>  4 & 15) * 17u <<  8)
-                      | (( t      & 15) * 17u);
-            }
-            break;
-
-        case TextureType::_8888:
-            memcpy(px, src, n * 4);
-            break;
-
-        default:
-            free(px);
-            return;
+        case TextureType::_565:  commitPx16(src, w, h, D3DFMT_R5G6B5);   break;
+        case TextureType::_5551: commitPx16(src, w, h, D3DFMT_A1R5G5B5); break;
+        case TextureType::_4444: commitPx16(src, w, h, D3DFMT_A4R4G4B4); break;
+        case TextureType::_8888: commitPx((const u32*)src, w, h);        break;
+        default: return;
         }
-
-        commitPx(px, w, h);
-        free(px);
     }
 
     bool Delete() override
     {
         if (!BaseTextureCacheData::Delete()) return false;
-        if (d3dtex) { d3dtex->Release(); d3dtex = nullptr; }
+        if (d3dtex)
+        {
+            d3dtex->Release();
+            d3dtex = nullptr;
+            g_texCacheBytes -= texBytes;
+            g_texCacheCount--;
+            texBytes = 0;
+        }
         return true;
     }
 };
@@ -267,8 +290,16 @@ static const int MAX_I = 65536;
 struct XboxD3D8Renderer final : Renderer
 {
     IDirect3DDevice8*       dev  = nullptr;
-    IDirect3DVertexBuffer8* vb   = nullptr;
-    IDirect3DIndexBuffer8*  ib   = nullptr;
+    // Triple-buffered geometry: a single VB/IB locked with flag 0 every frame
+    // BLOCKS until the GPU finishes reading it -- invisible in calm scenes (GPU
+    // idles early) but multi-millisecond in texture-storm scenes (GPU saturated
+    // by upload DMA), which is exactly the measured rend inflation 1.3ms->8-9ms
+    // at equal draw counts. Rotating 3 buffers means the one we lock was last
+    // touched by the GPU two frames ago: never contended. Cost: ~1.9MB extra.
+    static const int GEO_BUFS = 3;
+    IDirect3DVertexBuffer8* vbs[GEO_BUFS] = {};
+    IDirect3DIndexBuffer8*  ibs[GEO_BUFS] = {};
+    int                     geoBuf = 0;
     IDirect3DSurface8*      bb   = nullptr;   // backbuffer (D3DSWAPEFFECT_COPY keeps it alive)
     IDirect3DSurface8*      ds   = nullptr;   // depth+stencil
     XboxTexCache            tc;
@@ -276,6 +307,21 @@ struct XboxD3D8Renderer final : Renderer
     int                     m_nv   = 0;
     int                     m_ni   = 0;
     int                     s_frame = 0;
+
+    // applyPoly state cache: consecutive polys (often most of a mesh/list)
+    // commonly share identical material state, but every D3D Set*() call has
+    // real driver-side cost (nv2a pushbuffer command write + validation) even
+    // when the value is unchanged. Skip the call when it is. Sentinels never
+    // match a real value, so the very first applyPoly call always sets fresh
+    // state regardless of whatever the file browser (a separate D3D user,
+    // finished before the renderer starts) left behind.
+    IDirect3DTexture8* c_tex      = (IDirect3DTexture8*)(intptr_t)-1;
+    D3DPalette*        c_pal      = (D3DPalette*)(intptr_t)-1;
+    DWORD c_addrU = 0xFFFFFFFF, c_addrV = 0xFFFFFFFF;
+    DWORD c_minFilt = 0xFFFFFFFF, c_magFilt = 0xFFFFFFFF, c_mipFilt = 0xFFFFFFFF;
+    DWORD c_colorArg1 = 0xFFFFFFFF, c_colorArg2 = 0xFFFFFFFF, c_colorOp = 0xFFFFFFFF;
+    DWORD c_alphaArg1 = 0xFFFFFFFF, c_alphaArg2 = 0xFFFFFFFF, c_alphaOp = 0xFFFFFFFF;
+    DWORD c_specular  = 0xFFFFFFFF, c_srcBlend   = 0xFFFFFFFF, c_dstBlend  = 0xFFFFFFFF;
     int                     s_fault = 0;
 
     bool Init() override
@@ -283,11 +329,14 @@ struct XboxD3D8Renderer final : Renderer
         dev = g_xbox_d3d_dev;
         if (!dev) return false;
 
-        if (FAILED(dev->CreateVertexBuffer(MAX_V * sizeof(TLVert), 0, 0,
-                       D3DPOOL_DEFAULT, &vb))) return false;
+        for (int i = 0; i < GEO_BUFS; ++i)
+        {
+            if (FAILED(dev->CreateVertexBuffer(MAX_V * sizeof(TLVert), 0, 0,
+                           D3DPOOL_DEFAULT, &vbs[i]))) return false;
 
-        if (FAILED(dev->CreateIndexBuffer(MAX_I * 2, 0, D3DFMT_INDEX16,
-                       D3DPOOL_DEFAULT, &ib))) return false;
+            if (FAILED(dev->CreateIndexBuffer(MAX_I * 2, 0, D3DFMT_INDEX16,
+                           D3DPOOL_DEFAULT, &ibs[i]))) return false;
+        }
 
         dev->GetBackBuffer(0, (D3DBACKBUFFER_TYPE)0, &bb);
         dev->GetDepthStencilSurface(&ds);
@@ -298,8 +347,11 @@ struct XboxD3D8Renderer final : Renderer
 
     void Term() override
     {
-        if (vb) { vb->Release(); vb = nullptr; }
-        if (ib) { ib->Release(); ib = nullptr; }
+        for (int i = 0; i < GEO_BUFS; ++i)
+        {
+            if (vbs[i]) { vbs[i]->Release(); vbs[i] = nullptr; }
+            if (ibs[i]) { ibs[i]->Release(); ibs[i] = nullptr; }
+        }
         if (bb) { bb->Release(); bb = nullptr; }
         if (ds) { ds->Release(); ds = nullptr; }
     }
@@ -341,6 +393,17 @@ struct XboxD3D8Renderer final : Renderer
                    ? static_cast<XboxTex*>(pp.texture)
                    : nullptr;
 
+        // Resolve the desired state into locals first (matching the original
+        // textured/untextured branches exactly), then apply once with change
+        // detection below. Consecutive polys in a mesh/list very often share
+        // identical material state, but every Set*() call has real driver-side
+        // cost (nv2a pushbuffer command write + validation) even when the value
+        // is unchanged -- skip it when it is.
+        IDirect3DTexture8* wantTex = nullptr;
+        DWORD wantAddrU = 0, wantAddrV = 0, wantMinFilt = 0, wantMagFilt = 0, wantMipFilt = D3DTEXF_NONE;
+        DWORD wantColorArg1 = 0, wantColorArg2 = 0, wantColorOp = 0;
+        DWORD wantAlphaArg1 = 0, wantAlphaArg2 = 0, wantAlphaOp = 0;
+
         if (t && t->d3dtex)
         {
             // gpuPalette (P8) textures: bind the hardware palette for THIS poly's
@@ -351,78 +414,89 @@ struct XboxD3D8Renderer final : Renderer
                         ? ((u32)pp.tcw.PalSelect << 4)
                         : (((u32)pp.tcw.PalSelect >> 4) << 8);
                 D3DPalette* pal = GetXboxPalette(off);
-                if (pal) dev->SetPalette(0, pal);
+                if (pal && pal != c_pal) { dev->SetPalette(0, pal); c_pal = pal; }
             }
 
-            dev->SetTexture(0, t->d3dtex);
-
-            dev->SetTextureStageState(0, D3DTSS_ADDRESSU,
-                pp.tsp.ClampU ? D3DTADDRESS_CLAMP :
-                pp.tsp.FlipU  ? D3DTADDRESS_MIRROR :
-                                D3DTADDRESS_WRAP);
-            dev->SetTextureStageState(0, D3DTSS_ADDRESSV,
-                pp.tsp.ClampV ? D3DTADDRESS_CLAMP :
-                pp.tsp.FlipV  ? D3DTADDRESS_MIRROR :
-                                D3DTADDRESS_WRAP);
+            wantTex = t->d3dtex;
+            wantAddrU = pp.tsp.ClampU ? D3DTADDRESS_CLAMP : pp.tsp.FlipU ? D3DTADDRESS_MIRROR : D3DTADDRESS_WRAP;
+            wantAddrV = pp.tsp.ClampV ? D3DTADDRESS_CLAMP : pp.tsp.FlipV ? D3DTADDRESS_MIRROR : D3DTADDRESS_WRAP;
 
             DWORD filt = pp.tsp.FilterMode ? D3DTEXF_LINEAR : D3DTEXF_POINT;
-            dev->SetTextureStageState(0, D3DTSS_MINFILTER, filt);
-            dev->SetTextureStageState(0, D3DTSS_MAGFILTER, filt);
-            dev->SetTextureStageState(0, D3DTSS_MIPFILTER, D3DTEXF_NONE);
+            wantMinFilt = filt;
+            wantMagFilt = filt;
+            wantMipFilt = D3DTEXF_NONE;
 
             // Colour combine — matches the PC dx11 pixel shader exactly:
             //   ShadInstr 0  decal:   out.rgb = tex.rgb
             //   ShadInstr 1  modulate: out.rgb = tex.rgb * diff.rgb
             //   ShadInstr 2  decal-a:  out.rgb = lerp(diff.rgb, tex.rgb, tex.a)
             //   ShadInstr 3  mod-a:    out.rgb = tex.rgb * diff.rgb
-            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+            wantColorArg1 = D3DTA_TEXTURE;
+            wantColorArg2 = D3DTA_DIFFUSE;
             switch (pp.tsp.ShadInstr)
             {
-            case 0:
-                dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-                break;
-            case 2:
-                dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_BLENDTEXTUREALPHA);
-                break;
-            default:
-                dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-                break;
+            case 0: wantColorOp = D3DTOP_SELECTARG1; break;
+            case 2: wantColorOp = D3DTOP_BLENDTEXTUREALPHA; break;
+            default: wantColorOp = D3DTOP_MODULATE; break;
             }
 
             // Alpha combine
-            dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-            dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+            wantAlphaArg1 = D3DTA_TEXTURE;
+            wantAlphaArg2 = D3DTA_DIFFUSE;
             if (pp.tsp.ShadInstr == 2)
-            {
-                dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
-            }
+                wantAlphaOp = D3DTOP_SELECTARG2;
             else if (pp.tsp.ShadInstr == 3)
-            {
-                dev->SetTextureStageState(0, D3DTSS_ALPHAOP,
-                    pp.tsp.IgnoreTexA ? D3DTOP_SELECTARG2 : D3DTOP_MODULATE);
-            }
+                wantAlphaOp = pp.tsp.IgnoreTexA ? D3DTOP_SELECTARG2 : D3DTOP_MODULATE;
             else
-            {
-                dev->SetTextureStageState(0, D3DTSS_ALPHAOP,
-                    pp.tsp.IgnoreTexA ? D3DTOP_SELECTARG2 : D3DTOP_SELECTARG1);
-            }
+                wantAlphaOp = pp.tsp.IgnoreTexA ? D3DTOP_SELECTARG2 : D3DTOP_SELECTARG1;
         }
         else
         {
-            dev->SetTexture(0, NULL);
-            dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1);
-            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-            dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
-            dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+            wantColorOp   = D3DTOP_SELECTARG1;
+            wantColorArg1 = D3DTA_DIFFUSE;
+            wantAlphaOp   = D3DTOP_SELECTARG1;
+            wantAlphaArg1 = D3DTA_DIFFUSE;
+            // ARG2 intentionally left unresolved/uncompared here, matching the
+            // original: the untextured path never touched COLORARG2/ALPHAARG2,
+            // relying on SELECTARG1 not referencing them. See the "if (wantTex)"
+            // guard below, which mirrors that exactly.
         }
 
+#define APPLY_STATE(cache, want, callexpr) \
+        do { if ((want) != (cache)) { callexpr; (cache) = (want); ++g_stat_stateCalls; } \
+             else ++g_stat_stateSkipped; } while (0)
+
+        APPLY_STATE(c_tex, wantTex, dev->SetTexture(0, wantTex));
+
+        if (wantTex)   // sampler/filter state is only ever set in the textured path (matches original)
+        {
+            APPLY_STATE(c_addrU,   wantAddrU,   dev->SetTextureStageState(0, D3DTSS_ADDRESSU,  wantAddrU));
+            APPLY_STATE(c_addrV,   wantAddrV,   dev->SetTextureStageState(0, D3DTSS_ADDRESSV,  wantAddrV));
+            APPLY_STATE(c_minFilt, wantMinFilt, dev->SetTextureStageState(0, D3DTSS_MINFILTER, wantMinFilt));
+            APPLY_STATE(c_magFilt, wantMagFilt, dev->SetTextureStageState(0, D3DTSS_MAGFILTER, wantMagFilt));
+            APPLY_STATE(c_mipFilt, wantMipFilt, dev->SetTextureStageState(0, D3DTSS_MIPFILTER, wantMipFilt));
+
+            APPLY_STATE(c_colorArg2, wantColorArg2, dev->SetTextureStageState(0, D3DTSS_COLORARG2, wantColorArg2));
+            APPLY_STATE(c_alphaArg2, wantAlphaArg2, dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, wantAlphaArg2));
+        }
+
+        APPLY_STATE(c_colorArg1, wantColorArg1, dev->SetTextureStageState(0, D3DTSS_COLORARG1, wantColorArg1));
+        APPLY_STATE(c_colorOp,   wantColorOp,   dev->SetTextureStageState(0, D3DTSS_COLOROP,   wantColorOp));
+        APPLY_STATE(c_alphaArg1, wantAlphaArg1, dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, wantAlphaArg1));
+        APPLY_STATE(c_alphaOp,   wantAlphaOp,   dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   wantAlphaOp));
+
         // Specular offset add (only when the poly requests it)
-        dev->SetRenderState(D3DRS_SPECULARENABLE, pp.pcw.Offset ? TRUE : FALSE);
+        DWORD wantSpecular = pp.pcw.Offset ? TRUE : FALSE;
+        APPLY_STATE(c_specular, wantSpecular, dev->SetRenderState(D3DRS_SPECULARENABLE, wantSpecular));
 
         // Blend — enabled for ALL lists; opaque polys carry SRC=ONE/DST=ZERO (no-op)
-        dev->SetRenderState(D3DRS_SRCBLEND,  k_src[pp.tsp.SrcInstr & 7]);
-        dev->SetRenderState(D3DRS_DESTBLEND, k_dst[pp.tsp.DstInstr & 7]);
+        DWORD wantSrc = k_src[pp.tsp.SrcInstr & 7];
+        DWORD wantDst = k_dst[pp.tsp.DstInstr & 7];
+        APPLY_STATE(c_srcBlend, wantSrc, dev->SetRenderState(D3DRS_SRCBLEND,  wantSrc));
+        APPLY_STATE(c_dstBlend, wantDst, dev->SetRenderState(D3DRS_DESTBLEND, wantDst));
+
+        ++g_stat_polys;
+#undef APPLY_STATE
     }
 
     void drawList(std::vector<PolyParam>& polys)
@@ -434,6 +508,7 @@ struct XboxD3D8Renderer final : Renderer
             applyPoly(pp);
             dev->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP,
                                       0, m_nv, pp.first, pp.count - 2);
+            ++g_stat_drawCalls;
         }
     }
 
@@ -480,6 +555,7 @@ struct XboxD3D8Renderer final : Renderer
             applyPoly(rc->global_param_tr[poly]);
             dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,
                                       0, m_nv, runFirst, runCount / 3);
+            ++g_stat_drawCalls;
             i = j;
         }
     }
@@ -502,6 +578,9 @@ struct XboxD3D8Renderer final : Renderer
         if (nv > MAX_V) nv = MAX_V;
         if (ni > MAX_I) ni = MAX_I;
 
+        g_stat_verts = (unsigned)nv;
+        g_stat_idx   = (unsigned)ni;
+
         // DC depth is a per-vertex 1/w (larger = nearer). XYZRHW uses the .z
         // field as the [0,1] z-buffer value (rhw stays = 1/w for perspective-
         // correct texturing). Normalize 1/w across the frame: nearest (max 1/w)
@@ -519,9 +598,18 @@ struct XboxD3D8Renderer final : Renderer
         const float wRange = maxW - minW;
         const bool  flatZ  = !(wRange > 1e-9f);
 
-        // Upload vertices
+        // Rotate to the geometry buffers the GPU finished with two frames ago
+        // (see the GEO_BUFS comment at the members).
+        geoBuf = (geoBuf + 1) % GEO_BUFS;
+        IDirect3DVertexBuffer8* vb = vbs[geoBuf];
+        IDirect3DIndexBuffer8*  ib = ibs[geoBuf];
+
+        // Upload vertices (lock-stall time measured into g_stat_vbLockUs so the
+        // triple-buffering fix is verifiable from the RENDER log line).
+        const long long _lockT0 = qpcNow();
         TLVert* vp = nullptr;
         if (FAILED(vb->Lock(0, 0, (BYTE**)&vp, 0)) || !vp) return false;
+        g_stat_vbLockUs += (unsigned)qpcToUs(qpcNow() - _lockT0);
         for (int i = 0; i < nv; ++i)
         {
             const Vertex& v = rc->verts[i];
@@ -540,8 +628,10 @@ struct XboxD3D8Renderer final : Renderer
         vb->Unlock();
 
         // Upload indices (u32 → u16, clamp out-of-range to 0)
+        const long long _lockT1 = qpcNow();
         u16* ip = nullptr;
         if (FAILED(ib->Lock(0, 0, (BYTE**)&ip, 0)) || !ip) return false;
+        g_stat_vbLockUs += (unsigned)qpcToUs(qpcNow() - _lockT1);
         for (int i = 0; i < ni; ++i)
         {
             u32 idx = rc->idx[i];

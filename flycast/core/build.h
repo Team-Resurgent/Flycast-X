@@ -74,7 +74,14 @@
 #endif
 
 #ifndef FEAT_AREC
-	#if HOST_CPU == CPU_ARM || HOST_CPU == CPU_ARM64 || HOST_CPU == CPU_X64
+	// CPU_X86 RE-ENABLED again (2026-07-01) with the emitMemOp ecx-clobber fix
+	// (arm7_rec_x86.cpp): pre-indexed LDR/STR with a register-shifted offset
+	// ("Rm, LSL Rs") was corrupting the base address via getOperand's shift-by-
+	// register scratch use of ecx -- plausible cause of the reported audio
+	// crackling (ARM7's own sample-buffer accesses hitting this). If crackling
+	// persists with this fix, flip back to DYNAREC_NONE for CPU_X86 and A/B
+	// against the plain interpreter to rule the JIT in/out entirely.
+	#if HOST_CPU == CPU_ARM || HOST_CPU == CPU_ARM64 || HOST_CPU == CPU_X86 || HOST_CPU == CPU_X64
 		#define FEAT_AREC DYNAREC_JIT
 	#else
 		#define FEAT_AREC DYNAREC_NONE

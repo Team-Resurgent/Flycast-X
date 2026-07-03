@@ -110,6 +110,103 @@ extern "C" volatile unsigned g_fault_unhandled;
 extern "C" volatile unsigned g_fault_lastaddr;
 extern "C" volatile unsigned g_fault_lastpc;
 
+// Component profiler: rdtsc cycles accumulated inside the interpreted hot paths so
+// the PERF line can show where a frame's time actually goes (SH-4 JIT vs the still-
+// interpreted ARM7/AICA vs render vs texture). rdtsc runs at the HOST clock under
+// xemu (not 733MHz), so we calibrate cycles->us against QPC at startup.
+#include <intrin.h>
+extern "C" volatile long long g_prof_arm_cyc  = 0;   // ARM7 sound CPU (interpreted)
+extern "C" volatile long long g_prof_aica_cyc = 0;   // AICA sample gen + DSP (interpreted)
+extern "C" volatile long long g_prof_tex_cyc  = 0;   // texture upload + format convert
+extern "C" volatile unsigned  g_arm_fallbacks = 0;   // ARM7 JIT -> interpreter fallbacks
+
+// MMU diagnostics (mmu.cpp): direct measurement of mmu_data_translation, since
+// the TLB last-hit cache showed no measurable change and indirect (game vs
+// game) comparison isn't pinning down the real cost driver.
+extern "C" volatile long long g_prof_mmu_cyc  = 0;
+extern "C" volatile unsigned  g_prof_mmu_calls = 0;
+extern "C" volatile unsigned  g_prof_mmu_slow  = 0;
+
+// ---- Sampling profiler ----------------------------------------------------
+// Every ~2ms a background thread freezes the emu thread (DmSuspendThread, the
+// proven watchdog technique), reads its host EIP, and buckets it: SH4 JIT block
+// bodies vs generated memory handlers vs ARM7 JIT vs C code (by 4K page).
+// This is the measurement that ends the guessing: three structural JIT
+// optimizations (deferred MMU spills, TLB cache, inline dispatch) all measured
+// ZERO, so the time must be inside the block bodies or in C helpers -- this
+// says which, with addresses.
+// RESULT (2026-07-02): the sampler is BLIND -- ~100% of samples land on kernel
+// page 0x8001f regardless of what the emu thread is doing, because
+// DmGetThreadContext on a running thread returns the kernel's APC-delivery
+// context, not the interrupted user EIP. (This also means the watchdog's
+// "HOST EIP" reads were trap-frame artifacts.) Left off; superseded by the
+// emitted execution-shape counters (g_cnt_* below).
+static const bool kSampleProfiler = false;
+
+// Execution-shape counters, bumped by `inc` instructions EMITTED INTO the JIT
+// code itself (rec_x86.cpp block prologue, x86_ops.cpp mem handlers + ifb) --
+// this cannot lie about what the generated code executes.
+extern "C" unsigned g_cnt_block = 0;   // SH4 block entries
+extern "C" unsigned g_cnt_memh  = 0;   // generated memory-handler entries
+extern "C" unsigned g_cnt_ifb   = 0;   // interpreter fallbacks (shop_ifb)
+
+// MMU block-linking diagnostics (driver.cpp rdv_LinkBlock): stub = link-stub
+// invocations (should collapse to ~0 in steady scenes once edges are wired);
+// wired = links persisted; rej = persistence rejected (syscall traps etc.,
+// permanent slow edges).
+extern "C" unsigned g_cnt_linkStub  = 0;
+extern "C" unsigned g_cnt_linkWired = 0;
+extern "C" unsigned g_cnt_linkRej   = 0;
+
+// Compile-time emission counters (rec_x86.cpp relinkBlock) + live MMU state:
+// diagnoses whether gameplay blocks are even compiled in MMU mode. wired=0 +
+// rej=0 + MMU calls/f=0 all along suggests WinCE may run gameplay with the
+// MMU OFF -- which would reframe the entire MMU optimization campaign.
+extern "C" unsigned g_cnt_emitMmuLink  = 0;
+extern "C" unsigned g_cnt_emitMmuNoUpd = 0;
+extern "C" unsigned g_cnt_emitNonMmu   = 0;
+extern bool mmuOn;   // hw/sh4/modules/mmu.cpp
+
+// Texture-cache accounting (xbox_d3d8_renderer.cpp). Drives the hard byte
+// budget below: MvC2's sprite streaming can outgrow RAM (hardware run showed
+// freeMB 27 -> 0 -> crash across a session), so evict deterministically by
+// BYTES before the system runs dry, instead of only reacting to low freeMB
+// (by which time fragmentation and other allocations are already failing).
+extern "C" unsigned g_texCacheBytes;
+extern "C" unsigned g_texCacheCount;
+static const unsigned kTexBudgetBytes = 8u << 20;   // 8MB of D3D textures
+
+// Code-range registration (assigned by driver.cpp / x86_ops.cpp / arm7_rec.cpp).
+extern "C" u8 *g_sh4CacheStart = nullptr;
+extern "C" u32 g_sh4CacheSize = 0;
+extern "C" const u8 *g_memHandlerStart = nullptr;
+extern "C" const u8 *g_memHandlerEnd = nullptr;
+extern "C" u8 *g_arm7CacheStart = nullptr;
+extern "C" u32 g_arm7CacheSize = 0;
+
+// Sample buckets (reset every PERF window by the render thread; races with the
+// sampler are acceptable for diagnostics).
+static volatile unsigned g_smp_block = 0;   // SH4 JIT compiled block bodies (+dispatch blob)
+static volatile unsigned g_smp_memh  = 0;   // generated memory-access handlers
+static volatile unsigned g_smp_arm7  = 0;   // ARM7 JIT cache
+static volatile unsigned g_smp_c     = 0;   // static C/C++ code
+static volatile u32      g_smp_pages[48][2]; // C samples by 4K page: {page, count}
+
+// Anchors: runtime addresses of known subsystems, printed once, so the C-page
+// histogram can be attributed to functions straight from the log.
+int UpdateSystem_INTC();
+namespace aica { namespace sgc { void AICA_Sample(); } }
+
+// Render diagnostics (xbox_d3d8_renderer.cpp): what is "rend" cost actually
+// bound by -- draw-call count, state-change count, or vertex/index throughput?
+extern "C" volatile unsigned g_stat_drawCalls;
+extern "C" volatile unsigned g_stat_stateCalls;
+extern "C" volatile unsigned g_stat_stateSkipped;
+extern "C" volatile unsigned g_stat_verts;
+extern "C" volatile unsigned g_stat_idx;
+extern "C" volatile unsigned g_stat_polys;
+extern "C" unsigned g_stat_vbLockUs;   // GPU-sync stall time in VB/IB Lock
+
 static unsigned g_sehCode = 0, g_sehAddr = 0;
 static int sehFilter(struct _EXCEPTION_POINTERS* ep)
 {
@@ -243,6 +340,13 @@ static void dumpGuestAscii(const char* tag, u32 vaddr, int bytes)
 // any hot game loop). Flip to true to debug a new boot/hang.
 static const bool kDebugTrace = false;
 
+// Per-window diagnostic prints (PERF/FRAME/MMU/JITCNT/MMUSTATE/MEMSTAT/RENDER
+// lines). OFF for release: every line is a blocking serial write. Flip to true
+// (together with kJitCounters in rec_x86.cpp/x86_ops.cpp for the JITCNT
+// counts) when profiling. The texture byte-budget / memory-pressure logic is
+// NOT affected -- it runs unconditionally in the frame loop.
+static const bool kPerfLog = false;
+
 static volatile unsigned g_mainLoopBeat = 0;
 static DWORD WINAPI watchdogThread(LPVOID)
 {
@@ -325,6 +429,56 @@ static DWORD WINAPI watchdogThread(LPVOID)
     }
 }
 
+// EIP sampler: freeze the emu thread every ~2ms, classify where it was.
+// Never prints while the target is suspended (serial-lock deadlock).
+static DWORD WINAPI samplerThread(LPVOID)
+{
+    for (;;)
+    {
+        Sleep(2);
+        if (!g_emuTid)
+            continue;
+        CONTEXT cx;
+        memset(&cx, 0, sizeof(cx));
+        cx.ContextFlags = CONTEXT_CONTROL;
+        DmSuspendThread(g_emuTid);
+        DmGetThreadContext(g_emuTid, &cx);
+        DmResumeThread(g_emuTid);
+        u32 eip = (u32)cx.Eip;
+        if (eip == 0)
+            continue;
+
+        if (g_sh4CacheStart != nullptr
+            && eip >= (u32)(uintptr_t)g_sh4CacheStart
+            && eip <  (u32)(uintptr_t)g_sh4CacheStart + g_sh4CacheSize)
+        {
+            if (g_memHandlerStart != nullptr
+                && eip >= (u32)(uintptr_t)g_memHandlerStart
+                && eip <  (u32)(uintptr_t)g_memHandlerEnd)
+                g_smp_memh++;
+            else
+                g_smp_block++;
+        }
+        else if (g_arm7CacheStart != nullptr
+            && eip >= (u32)(uintptr_t)g_arm7CacheStart
+            && eip <  (u32)(uintptr_t)g_arm7CacheStart + g_arm7CacheSize)
+        {
+            g_smp_arm7++;
+        }
+        else
+        {
+            g_smp_c++;
+            u32 page = eip >> 12;
+            for (int i = 0; i < 48; i++)
+            {
+                if (g_smp_pages[i][0] == page) { g_smp_pages[i][1]++; break; }
+                if (g_smp_pages[i][0] == 0)    { g_smp_pages[i][0] = page; g_smp_pages[i][1] = 1; break; }
+            }
+        }
+    }
+    return 0;
+}
+
 static bool runEmu()
 {
     __try
@@ -401,14 +555,55 @@ static bool runEmu()
         // ~100% == locked to 1x (audio rate-correct); >100% == running fast.
         LARGE_INTEGER wallBase; QueryPerformanceCounter(&wallBase);
         u64 emuClkBase = sh4_sched_now64();
+        // Calibrate rdtsc cycles-per-microsecond against QPC (spin ~50ms). Needed
+        // because rdtsc = host clock under xemu, not the emulated 733MHz.
+        long long cycPerUs;
+        {
+            LARGE_INTEGER a; QueryPerformanceCounter(&a);
+            long long c0 = (long long)__rdtsc();
+            LARGE_INTEGER b;
+            do { QueryPerformanceCounter(&b); }
+            while ((b.QuadPart - a.QuadPart) * 1000 / qfreq.QuadPart < 50);
+            long long c1 = (long long)__rdtsc();
+            long long us = (b.QuadPart - a.QuadPart) * 1000000 / qfreq.QuadPart;
+            cycPerUs = us > 0 ? (c1 - c0) / us : 733;
+            if (cycPerUs < 1) cycPerUs = 1;
+        }
+        long long armBase = g_prof_arm_cyc, aicaBase = g_prof_aica_cyc, texBase = g_prof_tex_cyc;
+        unsigned armFbBase = g_arm_fallbacks;
+        unsigned drawBase = g_stat_drawCalls, stateCallBase = g_stat_stateCalls;
+        unsigned stateSkipBase = g_stat_stateSkipped, polyBase = g_stat_polys;
+        long long mmuCycBase = g_prof_mmu_cyc;
+        unsigned mmuCallBase = g_prof_mmu_calls, mmuSlowBase = g_prof_mmu_slow;
+        unsigned cntBlockBase = g_cnt_block, cntMemhBase = g_cnt_memh, cntIfbBase = g_cnt_ifb;
+        unsigned linkStubBase = g_cnt_linkStub, linkWiredBase = g_cnt_linkWired, linkRejBase = g_cnt_linkRej;
         g_emuTid = GetCurrentThreadId();                        // for the watchdog's host-EIP read
         if (kDebugTrace)
             CreateThread(NULL, 0, watchdogThread, NULL, 0, NULL);   // SH-4 hang detector
+        if (kSampleProfiler)
+            CreateThread(NULL, 0, samplerThread, NULL, 0, NULL);    // EIP sampling profiler
         for (;;)                       // run the BIOS forever; renderer presents each frame
         {
             g_mainLoopBeat++;          // watchdog liveness tick
             os_DoEvents();
             xbox_PollInput();          // Xbox pad -> mapleInputState[]
+
+            // Drive adaptive texture eviction from real free RAM (cheap kernel
+            // query). When headroom gets thin, the texcache evicts hard so big
+            // WinCE games (SA1) stay bounded instead of OOMing. Hysteresis avoids
+            // flapping right at the threshold.
+            {
+                extern volatile int textureMemPressure;
+                MEMORYSTATUS mp; mp.dwLength = sizeof(mp); GlobalMemoryStatus(&mp);
+                int fmb = (int)(mp.dwAvailPhys / (1024 * 1024));
+                // Pressure on: texture bytes over the hard budget OR system RAM
+                // getting thin. Off: comfortably under budget AND healthy freeMB
+                // (hysteresis avoids flapping).
+                if (g_texCacheBytes > kTexBudgetBytes || fmb < 14)
+                    textureMemPressure = 1;
+                else if (g_texCacheBytes < kTexBudgetBytes * 3 / 4 && fmb > 18)
+                    textureMemPressure = 0;
+            }
 
             // HEARTBEAT + WEDGE DETECT (boot-hang debug). Every 8 frames print the
             // SH-4 pc. If the pc stays put for ~64 frames the game is spinning in a
@@ -457,7 +652,7 @@ static bool runEmu()
             LARGE_INTEGER b; QueryPerformanceCounter(&b);
             emuUsAcc += (b.QuadPart - a.QuadPart) * 1000000 / qfreq.QuadPart;
 
-            if (++frame % 60 == 0)
+            if (kPerfLog && ++frame % 60 == 0)
             {
                 long long renderUs = g_renderUs - renderBase;
                 renderBase = g_renderUs;
@@ -491,6 +686,153 @@ static bool runEmu()
                 wsprintfA(buf, "FLYCAST PERF: %dms REAL %dfps speed=%d%% freeMB=%d | flt=%u fpcb=%u rw=%u smc=%u vram=%u bad=%u pc=%08x\n",
                           totalMs, realFps, speedPct, freeMB, faults,
                           dFpcb, dRewr, dSmc, dVram, dUnh, (unsigned)Sh4cntx.pc);
+                OutputDebugStringA(buf);
+
+                // Component breakdown, microseconds per frame. arm=ARM7 sound CPU,
+                // aica=AICA sample gen+DSP (both interpreted), rend=D3D8 draw,
+                // tex=texture upload/convert, sh4=everything else (SH-4 JIT +
+                // scheduler + MMU), computed as the remainder. This is what tells
+                // us where to spend optimization effort.
+                long long armUsPf  = (g_prof_arm_cyc  - armBase)  / cycPerUs / 60;  armBase  = g_prof_arm_cyc;
+                long long aicaUsPf = (g_prof_aica_cyc - aicaBase) / cycPerUs / 60;  aicaBase = g_prof_aica_cyc;
+                long long texUsPf  = (g_prof_tex_cyc  - texBase)  / cycPerUs / 60;  texBase  = g_prof_tex_cyc;
+                long long totUsPf  = emuUsAcc / 60;
+                long long rendUsPf = renderUs / 60;
+                long long sh4UsPfRaw = totUsPf - rendUsPf - armUsPf - aicaUsPf;   // pre-clamp, kept for the debug print below
+                long long sh4UsPf  = sh4UsPfRaw < 0 ? 0 : sh4UsPfRaw;
+                unsigned armFbPf = (g_arm_fallbacks - armFbBase) / 60;  armFbBase = g_arm_fallbacks;
+
+                // ROOT-CAUSE FIX (2026-07-01): wsprintfA's "%lld" only consumes 4
+                // bytes per argument instead of 8, so every 64-bit value after the
+                // first shifted the rest of this line's fields by one slot (proven
+                // via the SH4DBG(i32) cross-check: printed "arm" was actually the
+                // true sh4 remainder, printed "rend" was actually the true arm cost,
+                // printed "armFallback/f" was actually the true aica cost -- the real
+                // rend/tex/fallback values never appeared at all). All these values
+                // fit comfortably in 32 bits (frame times are at most ~100ms), so
+                // %d with explicit casts sidesteps the bug entirely -- verified
+                // correct via the SH4DBG(i32) line this replaces.
+                wsprintfA(buf, "  FRAME us/f: total=%d sh4=%d arm=%d aica=%d rend=%d tex=%d | armFallback/f=%u\n",
+                          (int)totUsPf, (int)sh4UsPf, (int)armUsPf, (int)aicaUsPf,
+                          (int)rendUsPf, (int)texUsPf, armFbPf);
+                OutputDebugStringA(buf);
+
+                // Direct MMU data-translation measurement (mmu.cpp): mmuUs is
+                // microseconds/frame ACTUALLY spent in mmu_data_translation (a
+                // real, direct number, not inferred). calls/f = total invocations;
+                // slow/f = how many reached the 64-entry mmu_full_lookup instead of
+                // the fast_reg_lut early-out. If mmuUs is small relative to sh4's
+                // total, the MMU per-access cost isn't the driver and the real cost
+                // is elsewhere in JIT execution (register spilling, dispatch).
+                long long mmuUsPf = (g_prof_mmu_cyc - mmuCycBase) / cycPerUs / 60;  mmuCycBase = g_prof_mmu_cyc;
+                unsigned mmuCallPf = (g_prof_mmu_calls - mmuCallBase) / 60;  mmuCallBase = g_prof_mmu_calls;
+                unsigned mmuSlowPf = (g_prof_mmu_slow  - mmuSlowBase) / 60;  mmuSlowBase = g_prof_mmu_slow;
+                wsprintfA(buf, "  MMU: us/f=%d calls/f=%u slow/f=%u\n",
+                          (int)mmuUsPf, mmuCallPf, mmuSlowPf);
+                OutputDebugStringA(buf);
+
+                // Execution shape: how many block entries / memory-handler entries /
+                // interpreter fallbacks the generated code executed, per frame.
+                // blocks/f tells us average block length (guest work / blocks);
+                // memh/f the memory-access density; ifb/f the decoder-fallback rate
+                // (each ifb is a full C call -- a high rate here would explain the
+                // WinCE sh4 cost on its own).
+                unsigned cbPf = (g_cnt_block - cntBlockBase) / 60;  cntBlockBase = g_cnt_block;
+                unsigned cmPf = (g_cnt_memh  - cntMemhBase) / 60;  cntMemhBase = g_cnt_memh;
+                unsigned ciPf = (g_cnt_ifb   - cntIfbBase)  / 60;  cntIfbBase  = g_cnt_ifb;
+                // Link diagnostics: per-WINDOW (not per-frame) so one-time wiring
+                // events stay visible instead of dividing down to 0.
+                unsigned lsW = g_cnt_linkStub  - linkStubBase;   linkStubBase  = g_cnt_linkStub;
+                unsigned lwW = g_cnt_linkWired - linkWiredBase;  linkWiredBase = g_cnt_linkWired;
+                unsigned lrW = g_cnt_linkRej   - linkRejBase;    linkRejBase   = g_cnt_linkRej;
+                wsprintfA(buf, "  JITCNT: blocks/f=%u memh/f=%u ifb/f=%u | link/win: stub=%u wired=%u rej=%u\n",
+                          cbPf, cmPf, ciPf, lsW, lwW, lrW);
+                OutputDebugStringA(buf);
+
+                // Live MMU state + cumulative compile-branch counts: is gameplay
+                // code even compiled in MMU mode?
+                wsprintfA(buf, "  MMUSTATE: on=%d emitted mmuLink=%u mmuNoUpd=%u nonMmu=%u\n",
+                          mmuOn ? 1 : 0, g_cnt_emitMmuLink, g_cnt_emitMmuNoUpd, g_cnt_emitNonMmu);
+                OutputDebugStringA(buf);
+
+                // Who owns the RAM: total physical (once), free, and the texture
+                // cache's exact committed bytes + live texture count. If freeMB
+                // sinks while texKB stays at/below budget, the leak is elsewhere
+                // and this line points the hunt away from textures.
+                {
+                    extern volatile int textureMemPressure;
+                    static bool s_totalPrinted = false;
+                    if (!s_totalPrinted)
+                    {
+                        s_totalPrinted = true;
+                        MEMORYSTATUS mt; mt.dwLength = sizeof(mt); GlobalMemoryStatus(&mt);
+                        wsprintfA(buf, "  MEMSTAT: totalPhys=%uMB\n",
+                                  (unsigned)(mt.dwTotalPhys / (1024 * 1024)));
+                        OutputDebugStringA(buf);
+                    }
+                    wsprintfA(buf, "  MEMSTAT: free=%dMB tex=%uKB texN=%u pressure=%d\n",
+                              freeMB, g_texCacheBytes >> 10, g_texCacheCount,
+                              textureMemPressure);
+                    OutputDebugStringA(buf);
+                }
+
+                if (kSampleProfiler)
+                {
+                    // Anchors once, so C pages in the histogram can be attributed
+                    // to subsystems straight from the log.
+                    static bool s_anchorsPrinted = false;
+                    if (!s_anchorsPrinted)
+                    {
+                        s_anchorsPrinted = true;
+                        wsprintfA(buf, "  SMP-ANCHORS: img=%08x UpdateSystem_INTC=%08x AICA_Sample=%08x sh4cache=%08x memh=%08x-%08x arm7=%08x\n",
+                                  (unsigned)(uintptr_t)&watchdogThread,
+                                  (unsigned)(uintptr_t)&UpdateSystem_INTC,
+                                  (unsigned)(uintptr_t)&aica::sgc::AICA_Sample,
+                                  (unsigned)(uintptr_t)g_sh4CacheStart,
+                                  (unsigned)(uintptr_t)g_memHandlerStart,
+                                  (unsigned)(uintptr_t)g_memHandlerEnd,
+                                  (unsigned)(uintptr_t)g_arm7CacheStart);
+                        OutputDebugStringA(buf);
+                    }
+
+                    // Snapshot + reset buckets, pick the top 4 C pages.
+                    unsigned sBlock = g_smp_block; g_smp_block = 0;
+                    unsigned sMemh  = g_smp_memh;  g_smp_memh  = 0;
+                    unsigned sArm7  = g_smp_arm7;  g_smp_arm7  = 0;
+                    unsigned sC     = g_smp_c;     g_smp_c     = 0;
+                    u32 topPage[4] = {0,0,0,0}; u32 topCnt[4] = {0,0,0,0};
+                    for (int i = 0; i < 48; i++)
+                    {
+                        u32 p = g_smp_pages[i][0], n = g_smp_pages[i][1];
+                        g_smp_pages[i][0] = 0; g_smp_pages[i][1] = 0;
+                        if (p == 0 || n == 0) continue;
+                        for (int k = 0; k < 4; k++)
+                            if (n > topCnt[k])
+                            {
+                                for (int m = 3; m > k; m--) { topCnt[m] = topCnt[m-1]; topPage[m] = topPage[m-1]; }
+                                topCnt[k] = n; topPage[k] = p;
+                                break;
+                            }
+                    }
+                    wsprintfA(buf, "  SMP: block=%u memh=%u arm7=%u c=%u | c-top: %05x:%u %05x:%u %05x:%u %05x:%u\n",
+                              sBlock, sMemh, sArm7, sC,
+                              (unsigned)topPage[0], (unsigned)topCnt[0],
+                              (unsigned)topPage[1], (unsigned)topCnt[1],
+                              (unsigned)topPage[2], (unsigned)topCnt[2],
+                              (unsigned)topPage[3], (unsigned)topCnt[3]);
+                    OutputDebugStringA(buf);
+                }
+
+                // Render diagnostics: is rend cost bound by draw-call count,
+                // state-change count, or vertex/index throughput? verts/idx are
+                // instantaneous (last frame's counts, not summed over the window).
+                unsigned drawPf = (g_stat_drawCalls - drawBase) / 60;  drawBase = g_stat_drawCalls;
+                unsigned setPf  = (g_stat_stateCalls - stateCallBase) / 60;  stateCallBase = g_stat_stateCalls;
+                unsigned skipPf = (g_stat_stateSkipped - stateSkipBase) / 60;  stateSkipBase = g_stat_stateSkipped;
+                unsigned polyPf = (g_stat_polys - polyBase) / 60;  polyBase = g_stat_polys;
+                unsigned vbLockPf = g_stat_vbLockUs / 60;  g_stat_vbLockUs = 0;
+                wsprintfA(buf, "  RENDER: draws/f=%u polys/f=%u stateSet/f=%u stateSkip/f=%u verts=%u idx=%u vbLock/f=%uus\n",
+                          drawPf, polyPf, setPf, skipPf, g_stat_verts, g_stat_idx, vbLockPf);
                 OutputDebugStringA(buf);
                 emuUsAcc = 0;
             }

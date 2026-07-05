@@ -22,6 +22,18 @@ struct RuntimeBlockInfo
 	u32 host_code_size;	//in bytes
 	u32 sh4_code_size; //in bytes
 
+	// Xbox port JIT audit: execution count bumped by an inc emitted in the
+	// block prologue (kBlockProfile in rec_x86.cpp); dumped and reset by
+	// bm_DumpHotBlocks so the hottest blocks' emitted x86 can be inspected.
+	// Also bumped for idleCandidate blocks (see below) to drive the automatic
+	// idle-loop detector (bm_AutoIdleScan).
+	u32 profRuns = 0;
+
+	// Set at compile time when the block has the wait-loop fingerprint (tiny,
+	// read-only, tight backward branch). Only such blocks are eligible for the
+	// automatic idle-loop skip.
+	bool idleCandidate = false;
+
 	fpscr_t fpu_cfg;
 	u32 guest_cycles;
 	u32 guest_opcodes;
@@ -67,6 +79,20 @@ struct RuntimeBlockInfo
 };
 
 void bm_WriteBlockMap(const std::string& file);
+
+// Xbox port JIT audit: print the topN hottest blocks (by profRuns*guest_cycles)
+// with their SH4 words and emitted x86 bytes, then reset all counts.
+void bm_DumpHotBlocks(int topN);
+
+// Automatic idle-loop skip (generalizes the hand-found MvC2 wait loop to every
+// game): candidates are flagged at compile time (see idleCandidate); the scan,
+// called ~once/second by the platform frame loop, arms any candidate spinning
+// above the wait-loop rate and recompiles it with the timeslice drain.
+// gameRendering: whether the game submitted TA geometry in the last interval.
+// Arming only happens while rendering; when rendering stops, ALL auto entries
+// are disarmed (loader pump loops masquerade as wait loops -- see the scan).
+void bm_AutoIdleScan(bool gameRendering);
+bool bm_IsAutoIdleBlock(RuntimeBlockInfo* block);
 
 DynarecCodeEntryPtr DYNACALL bm_GetCodeByVAddr(u32 addr);
 RuntimeBlockInfoPtr bm_GetBlock(void* dynarec_code);

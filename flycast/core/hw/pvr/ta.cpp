@@ -542,8 +542,12 @@ static void DYNACALL ta_thd_data32_i(const simd256_t *data)
 
 	// First byte is PCW
 	PCW pcw = *(const PCW*)data;
-	
-	// Copy the TA data
+
+	// Copy the TA data. (An explicit movaps-pair version was tried 2026-07-03
+	// and REVERTED during the MvC2-glitch bisect: the DMA path can pass source
+	// pointers whose 16-byte alignment isn't guaranteed, and __m128 member
+	// loads emit movaps, which faults on misalignment. Struct assignment lets
+	// the compiler pick safe code.)
 	*dst = *data;
 
 	ta_tad.thd_data += 32;

@@ -36,6 +36,9 @@ static u32 g_palGen = 1;
 // from emulation cost. Defined here, read via extern in main.
 volatile long long g_renderUs = 0;
 extern "C" volatile long long g_prof_tex_cyc;   // texture-upload profiler (defined in main_xbox)
+// GetTexture time probe (defined in main_xbox.cpp; see GetTexture below)
+extern "C" void xbox_texLkProbeBegin();
+extern "C" void xbox_texLkProbeEnd();
 
 // Render diagnostics: figure out what "rend" cost is actually bound by (call
 // count vs vertex/index throughput) instead of guessing. main_xbox.cpp samples
@@ -374,12 +377,17 @@ struct XboxD3D8Renderer final : Renderer
 
     BaseTextureCacheData* GetTexture(TSP tsp, TCW tcw, int area) override
     {
+        // texlk probe: GetTexture runs INSIDE the TA decode loop (per poly
+        // param), so its cost -- cache lookup, volatile-texture hashing,
+        // reconvert, upload -- hides inside parse/dec. Measure it directly.
+        xbox_texLkProbeBegin();
         XboxTex* t = tc.getTextureCacheData(tsp, tcw, area);
         if (t->NeedsUpdate())
             t->Update();
         // gpuPalette colour staleness is handled in GetXboxPalette(): the shared
         // hardware palette refreshes its entries when g_palGen advances. The P8
         // index texture itself never needs re-uploading on a palette change.
+        xbox_texLkProbeEnd();
         return t;
     }
 
@@ -636,11 +644,17 @@ struct XboxD3D8Renderer final : Renderer
         TLVert* vp = nullptr;
         if (FAILED(vb->Lock(0, 0, (BYTE**)&vp, 0)) || !vp) return false;
         g_stat_vbLockUs += (unsigned)qpcToUs(qpcNow() - _lockT0);
+        // One reciprocal instead of a divide per vertex (fdiv is ~30-40 cycles
+        // on the P3; heavy 3D scenes fill 18k verts = ~1ms of pure division).
+        // flatZ folds in for free: invWRange = 0 makes every z exactly 0.
+        // (Was briefly reverted during the 2026-07-03 MvC2 bisect; exonerated —
+        // the actual bug was vec-FPU precision, fixed in x86_ops.cpp.)
+        const float invWRange = flatZ ? 0.f : 1.0f / wRange;
         for (int i = 0; i < nv; ++i)
         {
             const Vertex& v = rc->verts[i];
             float w = v.z > 0.f ? v.z : 1e-10f;
-            float z = flatZ ? 0.0f : (maxW - w) / wRange;   // near -> 0
+            float z = (maxW - w) * invWRange;   // near -> 0
             if (z < 0.f) z = 0.f; else if (z > 1.f) z = 1.f;
             vp[i].x        = v.x;
             vp[i].y        = v.y;
@@ -672,6 +686,10 @@ struct XboxD3D8Renderer final : Renderer
         // uncached reads of it would cost more than the merge saves. Winding
         // parity across joins doesn't matter: CULLMODE is NONE.
         {
+            // Re-enabled 2026-07-03: the MvC2 missing-text bug bisected to the
+            // vec-FPU precision issue (fixed with x87 double in x86_ops.cpp);
+            // stitching was exonerated (glitch persisted with it off).
+            static const bool kStitchStrips = true;
             u32 wcur = (u32)ni;
             auto buildRuns = [&](std::vector<PolyParam>& polys, std::vector<DrawRun>& runs)
             {
@@ -684,6 +702,13 @@ struct XboxD3D8Renderer final : Renderer
                     if (pp.count < 3 || (int)(pp.first + pp.count) > ni)
                     {
                         ++p;    // invalid poly: skipped (as before batching)
+                        continue;
+                    }
+                    if (!kStitchStrips)
+                    {
+                        // Unbatched: one draw per poly from the original strip region.
+                        runs.push_back({pp.first, pp.count, (u32)p, 1});
+                        ++p;
                         continue;
                     }
                     if (wcur + pp.count > (u32)MAX_TRI_I)

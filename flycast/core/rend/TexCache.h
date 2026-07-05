@@ -91,6 +91,8 @@ public:
 	u32 lastUsedFrame = 0;	// frame number at which texture was last looked up (LRU eviction)
 	u32 lastInvFrame = 0;	// frame of the previous invalidate() (volatile-texture detection)
 	u32 invStreak = 0;		// consecutive-frame invalidation count (see Update())
+	u32 volHash = 0;		// content hash of the last actual upload (volatile textures)
+	bool volHashValid = false;
 	vram_block* lock_block;
 
 	u32 mmStartAddress; // pixel data start address of max level mipmap

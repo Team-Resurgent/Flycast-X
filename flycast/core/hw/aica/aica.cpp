@@ -94,7 +94,9 @@ extern "C" volatile long long g_prof_aica_cyc;
 // cuts that churn; per-sample semantics (timers, mixing, ARM slices) are kept
 // inside arm::run's loop -- only SH4-visible AICA interrupt latency coarsens,
 // by (kAicaBatch-1) samples (23us each) worst case.
-static const int kAicaBatch = 4;
+// 8 = ~92 ticks/frame, worst-case latency ~160us -- still far below the ~1ms
+// granularity sound drivers work at. REVERT TO 4 if music/SFX timing misbehaves.
+static const int kAicaBatch = 8;
 
 static int AicaUpdate(int tag, int cycles, int jitter, void *arg)
 {

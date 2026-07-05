@@ -47,6 +47,26 @@ class Arm7Compiler;
 // esi/edi/ebp hold ARM registers; eax/ecx/edx/ebx are scratch. (ebp is safe as a
 // data register here -- ARM7 JIT code never faults, so no SEH frame is needed;
 // the SH-4 rec-x86 uses ebp the same way.)
+// ARM7 JIT execution-shape counters (defined in main_xbox.cpp, printed on the
+// perf log's ARM line). Flip to true for measurement builds only.
+// MvC2 measurement (2026-07): blk/f ~11.8k steady (up to 27k), sop/f == cond/f
+// == blk/f in-game -- tiny one-flag-op/one-conditional blocks, so the per-block
+// dispatch round trip dominates => block linking (kArmBlockLink below).
+static const bool kArmJitCounters = false;
+extern "C" unsigned g_cnt_armBlk;
+extern "C" unsigned g_cnt_armSop;
+extern "C" unsigned g_cnt_armCond;
+
+// Block linking: end blocks with inline cycle/interrupt checks plus a direct
+// jump through the target's *fixed* EntryPoints slot instead of jmp
+// arm_dispatch. The shared dispatcher's single indirect jmp is target-thrashed
+// by every block in the system (~700k exits/s in MvC2) and mispredicts almost
+// always on the P3; a per-block jump through a constant slot address is
+// monomorphic and predicted. Jumping through the table (never straight to
+// code) keeps this safe across JIT cache flushes: flush() just rewrites the
+// slots to arm_compilecode.
+static const bool kArmBlockLink = true;
+
 static const std::array<Xbyak::Reg32, 3> alloc_regs { esi, edi, ebp };
 
 class X86ArmRegAlloc : public ArmRegAlloc<std::size(alloc_regs), X86ArmRegAlloc>
@@ -606,6 +626,12 @@ class Arm7Compiler : public Xbyak::CodeGenerator
 		if (save_v_flag)
 			seto(dl);					// dl = OF (0/1), captured before eax is reshuffled below
 
+		// Counter must come AFTER lahf/seto: inc clobbers ZF/SF/OF, and placing
+		// it before the capture corrupts every ARM flag result (killed audio in
+		// the 2026-07 measurement build).
+		if (kArmJitCounters)
+			inc(dword[&g_cnt_armSop]);
+
 		shl(eax, 16);				// bit31=SF(N), bit30=ZF(Z); other bits are stale/masked next
 		and_(eax, Z_FLAG | N_FLAG);	// eax = Z,N
 
@@ -671,12 +697,137 @@ class Arm7Compiler : public Xbyak::CodeGenerator
 		call(recompiler::interpret);
 	}
 
+	// Block exit with linking (kArmBlockLink). Scans the block for every write
+	// to R15_ARM_NEXT; when the possible exit PCs are compile-time immediates
+	// (the overwhelmingly common case: branch target + decoder-inserted
+	// fallthrough MOV, or the 32-op split MOV), the exit re-does the
+	// dispatcher's cycle/interrupt checks inline and jumps through the fixed
+	// EntryPoints slot of the target -- a monomorphic indirect jump the P3 BTB
+	// predicts, unlike arm_dispatch's shared jump which is thrashed by every
+	// block. Unknown exits (BX LR style register branches, PC-writing
+	// fallbacks) get the same checks plus a per-block table jump. Compares are
+	// against the raw stored value, so if the static analysis ever misjudges,
+	// execution falls back to the generic path/dispatcher -- never to a wrong
+	// block.
+	void emitBlockExit(const std::vector<ArmOp>& block_ops)
+	{
+		if (!kArmBlockLink || entry_points == nullptr)
+		{
+			jmp((void*)arm_dispatch);
+			return;
+		}
+
+		u32 exitPc[2];
+		int nExit = 0;
+		bool exact = true;		// every R15_ARM_NEXT writer statically known
+		for (const ArmOp& op : block_ops)
+		{
+			bool writesPc = false;
+			bool known = false;
+			u32 val = 0;
+			if (op.op_type == ArmOp::B || op.op_type == ArmOp::BL)
+			{
+				writesPc = true;
+				if (op.arg[0].isImmediate()) {
+					val = op.arg[0].getImmediate();
+					known = true;
+				}
+			}
+			else if (op.op_type == ArmOp::FALLBACK)
+			{
+				// The interpreter writes R15_ARM_NEXT only for PC-setting ops
+				writesPc = (op.flags & ArmOp::OP_SETS_PC) != 0;
+			}
+			else if (op.rd.isReg() && op.rd.getReg().armreg == R15_ARM_NEXT)
+			{
+				writesPc = true;
+				if (op.op_type == ArmOp::MOV && !(op.flags & ArmOp::OP_SETS_FLAGS)
+						&& op.arg[0].isImmediate() && !op.arg[0].isShifted()) {
+					val = op.arg[0].getImmediate();
+					known = true;
+				}
+			}
+			if (!writesPc)
+				continue;
+			if (!known) {
+				exact = false;
+				continue;
+			}
+			bool dup = false;
+			for (int k = 0; k < nExit; k++)
+				if (exitPc[k] == val)
+					dup = true;
+			if (dup)
+				continue;
+			if (nExit < 2)
+				exitPc[nExit++] = val;
+			else
+				exact = false;	// 3+ distinct exits: extras take the guarded fallback
+		}
+		if (nExit == 0)
+			exact = false;
+
+		// Same checks arm_dispatch does before entering a block; the rare taken
+		// paths (timeslice over, FIQ pending) go to the full dispatcher.
+		Xbyak::Label toDispatch;
+		cmp(dword[&arm_Reg[CYCL_CNT].I], 0);
+		jle(toDispatch);
+		mov(eax, dword[&arm_Reg[INTR_PEND].I]);
+		test(eax, eax);
+		jne(toDispatch);
+
+		// 4-byte EntryPoints slots indexed by pc: byte offset == pc & 0x7ffffc
+		// (see arm_dispatch). entry_points is set once, before the first block
+		// ever compiles, and always to the same static table.
+		u8 *table = (u8 *)entry_points;
+		if (exact && nExit == 1)
+		{
+			// Single unconditional static exit: R15_ARM_NEXT can only hold it.
+			jmp(dword[table + (exitPc[0] & 0x7ffffc)]);
+		}
+		else if (exact && nExit == 2)
+		{
+			mov(ecx, dword[&arm_Reg[R15_ARM_NEXT].I]);
+			cmp(ecx, exitPc[0]);
+			Xbyak::Label other;
+			jne(other);
+			jmp(dword[table + (exitPc[0] & 0x7ffffc)]);
+			L(other);
+			jmp(dword[table + (exitPc[1] & 0x7ffffc)]);
+		}
+		else
+		{
+			mov(ecx, dword[&arm_Reg[R15_ARM_NEXT].I]);
+			for (int i = 0; i < nExit; i++)
+			{
+				Xbyak::Label next;
+				cmp(ecx, exitPc[i]);
+				jne(next);
+				jmp(dword[table + (exitPc[i] & 0x7ffffc)]);
+				L(next);
+			}
+			// Unknown target: per-block table jump (checks already done above)
+			and_(ecx, 0x7ffffc);
+			mov(edx, dword[&entry_points]);
+			jmp(dword[edx + ecx]);
+		}
+
+		L(toDispatch);
+		jmp((void*)arm_dispatch);
+	}
+
 public:
 	Arm7Compiler() : Xbyak::CodeGenerator(recompiler::spaceLeft(), recompiler::currentCode()) { }
 
 	void compile(const std::vector<ArmOp>& block_ops, u32 cycles)
 	{
 		regalloc = new X86ArmRegAlloc(*this, block_ops);
+
+		// Execution-shape counters for the ARM7 regalloc/flags rework (see
+		// kArmJitCounters below): blocks, flag-saving ops and conditional ops
+		// executed per frame. Measure builds only -- each inc is a memory RMW.
+		if (kArmJitCounters)
+			inc(dword[&g_cnt_armBlk]);
 
 		sub(dword[&arm_Reg[CYCL_CNT].I], cycles);
 
@@ -703,6 +854,8 @@ public:
 			{
 				endConditional(condLabel);
 				currentCondition = op.condition;
+				if (kArmJitCounters && op.condition != ArmOp::AL)
+					inc(dword[&g_cnt_armCond]);
 				condLabel = startConditional(op.condition);
 			}
 
@@ -736,7 +889,7 @@ public:
 		}
 		endConditional(condLabel);
 
-		jmp((void*)arm_dispatch);
+		emitBlockExit(block_ops);
 
 		ready();
 		recompiler::advance(getSize());

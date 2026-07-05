@@ -77,7 +77,9 @@
       <!-- VS2022's static C++ runtime is referenced LAST and by full path, so
            the linker pulls ONLY the locale objects (the symbols we no longer
            stub) from it; everything else resolves from our objs + RXDK first. -->
-      <AdditionalDependencies>xboxkrnl.lib;libcmt.lib;libcpmt.lib;oldnames.lib;xapilib.lib;d3d8.lib;d3dx8.lib;xgraphics.lib;dsound.lib;xbdm.lib</AdditionalDependencies>
+      <!-- NO xbdm.lib: importing the debug monitor makes the XBE unloadable on
+           a retail kernel (instant return-to-dash). See USE_XBDM in main_xbox.cpp. -->
+      <AdditionalDependencies>xboxkrnl.lib;libcmt.lib;libcpmt.lib;oldnames.lib;xapilib.lib;d3d8.lib;d3dx8.lib;xgraphics.lib;dsound.lib</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <!-- __CxxFrameHandler3 is now provided by xbox_eh_shim.cpp (a correct
            personality routine that doesn't hang on RWX-origin foreign exceptions),

@@ -33,9 +33,12 @@ extern bool pal_needs_update;
 // Xbox where SA1/MvC2 stream more textures than the heap can hold. Default 0.
 volatile int textureMemPressure = 0;
 
-// Perf counter (printed by the Xbox port): uploads that skipped re-protection
-// because the texture is rewritten every frame (see Update()).
+// Perf counters (printed by the Xbox port): volatile-texture uploads that
+// skipped re-protection, and volatile updates skipped entirely because the
+// source pixels hashed identical to the last upload (see Update()).
 extern "C" unsigned g_stat_volatileTex = 0;
+extern "C" unsigned g_stat_volSkip = 0;
+extern "C" unsigned g_stat_volHashBytes;	// defined in main_xbox.cpp; bytes hashed by the volatile hash-skip
 
 // Rough approximation of LoD bias from D adjust param, only used to increase LoD
 const std::array<f32, 16> D_Adjust_LoD_Bias = {
@@ -515,6 +518,29 @@ bool BaseTextureCacheData::Update()
 			return false;
 		}
 	}
+	if (invStreak >= 4)
+	{
+		// Volatile texture (rewritten by the game nearly every frame; page
+		// protection is skipped below). Before paying for a full reconvert +
+		// GPU upload, hash the source pixels: stage animations typically
+		// cycle at 8-15Hz, so most per-frame re-uploads are byte-identical
+		// to what the GPU already holds. ComputeHash folds in the current
+		// palette_hash (refreshed above) and tcw bits, so palette changes
+		// still force a real update. Measured 70-120 uploads/frame at
+		// 2-6ms/frame in MvC2's animated stages before this.
+		ComputeHash();
+		g_stat_volHashBytes += size;	// probe: how much the hash-skip actually hashes per window
+		if (volHashValid && texture_hash == volHash)
+		{
+			g_stat_volSkip++;
+			dirty = FrameCount;		// stay dirty: re-check on next use
+			size = originalSize;
+			return true;
+		}
+		volHash = texture_hash;
+		volHashValid = true;
+	}
+
 	if (custom_texture.enabled())
 	{
 		u32 oldHash = texture_hash;

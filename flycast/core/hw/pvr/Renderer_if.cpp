@@ -15,6 +15,12 @@
 #include <mutex>
 #include <deque>
 
+// Component profiler (Xbox port): QPC-based probe around Process() below.
+// (rdtsc-delta probes print garbage on the real console -- known artifact --
+// so this uses the platform's QPC helpers, which are hardware-reliable.)
+extern "C" void xbox_parseProbeBegin();
+extern "C" void xbox_parseProbeEnd();
+
 #ifdef LIBRETRO
 void retro_rend_present();
 void retro_resize_renderer(int w, int h, float aspectRatio);
@@ -189,14 +195,20 @@ private:
 #endif
 		{
 			FC_PROFILE_SCOPE_NAMED("Renderer::Process");
+			// Component profiler (Xbox port): Process/ta_parse converts raw TA
+			// data into render vertices on the CPU -- it hides inside the "sh4"
+			// bucket and scales with scene geometry, so measure it directly.
+			xbox_parseProbeBegin();
 			try {
 				renderer->Process(taContext);
 			} catch (...) {
+				xbox_parseProbeEnd();
 				renderEnd.Set();
 				rend_allow_rollback();
 				FinishRender(taContext);
 				throw;
 			}
+			xbox_parseProbeEnd();
 		}
 
 		if (renderToScreen)

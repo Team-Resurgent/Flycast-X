@@ -118,9 +118,112 @@ extern "C" volatile unsigned g_fault_lastpc;
 extern "C" volatile long long g_prof_arm_cyc  = 0;   // ARM7 sound CPU (interpreted)
 extern "C" volatile long long g_prof_aica_cyc = 0;   // AICA sample gen + DSP (interpreted)
 extern "C" volatile long long g_prof_tex_cyc  = 0;   // texture upload + format convert
-extern "C" volatile long long g_prof_ta_cyc   = 0;   // TA vertex parsing (ta.cpp, part of "sh4")
+extern "C" volatile long long g_prof_ta_cyc   = 0;   // TA FIFO copy+FSM (ta.cpp, part of "sh4")
 extern "C" unsigned           g_cnt_ta        = 0;   // ta_vtx_data32 calls (32-byte chunks)
+
+// Renderer::Process / ta_parse time (part of "sh4"). QPC-based: the rdtsc-delta
+// version printed garbage on real hardware (the known rdtsc probe artifact).
+extern "C" unsigned g_stat_parseUs = 0;
+static LARGE_INTEGER s_parseT0;
+extern "C" void xbox_parseProbeBegin()
+{
+    QueryPerformanceCounter(&s_parseT0);
+}
+extern "C" void xbox_parseProbeEnd()
+{
+    static LARGE_INTEGER s_qf = { 0 };
+    if (s_qf.QuadPart == 0)
+        QueryPerformanceFrequency(&s_qf);
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    g_stat_parseUs += (unsigned)((t1.QuadPart - s_parseT0.QuadPart) * 1000000 / s_qf.QuadPart);
+}
+
+// Nested probe inside parse: index building + translucency sort (ta_vtx.cpp
+// parseRenderPass). parse/f minus sort/f = the TaCmd vertex-decode share.
+extern "C" unsigned g_stat_sortUs = 0;
+static LARGE_INTEGER s_sortT0;
+extern "C" void xbox_sortProbeBegin()
+{
+    QueryPerformanceCounter(&s_sortT0);
+}
+extern "C" void xbox_sortProbeEnd()
+{
+    static LARGE_INTEGER s_qf = { 0 };
+    if (s_qf.QuadPart == 0)
+        QueryPerformanceFrequency(&s_qf);
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    g_stat_sortUs += (unsigned)((t1.QuadPart - s_sortT0.QuadPart) * 1000000 / s_qf.QuadPart);
+}
+
+// Second nested split of parse/f (fights spend ~1.3-1.9ms in "decode" =
+// parse - sort, and GetTexture runs INSIDE the decode loop): dec/f = the TaCmd
+// vertex-decode while-loop; texlk/f = renderer GetTexture (cache lookup +
+// volatile-texture hashing + reconvert + upload); hashKB/w = bytes hashed by
+// the volatile hash-skip in TexCache::Update. dec - texlk = pure vertex
+// conversion cost. Xbox QPC is a direct rdtsc wrapper (no user/kernel
+// transition), so the per-poly texlk probe (~500 QPC/frame) stays ~20-30us.
+extern "C" unsigned g_stat_decodeUs = 0;
+static LARGE_INTEGER s_decodeT0;
+extern "C" void xbox_decodeProbeBegin()
+{
+    QueryPerformanceCounter(&s_decodeT0);
+}
+extern "C" void xbox_decodeProbeEnd()
+{
+    static LARGE_INTEGER s_qf = { 0 };
+    if (s_qf.QuadPart == 0)
+        QueryPerformanceFrequency(&s_qf);
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    g_stat_decodeUs += (unsigned)((t1.QuadPart - s_decodeT0.QuadPart) * 1000000 / s_qf.QuadPart);
+}
+
+extern "C" unsigned g_stat_texLkUs = 0;
+static LARGE_INTEGER s_texLkT0;
+extern "C" void xbox_texLkProbeBegin()
+{
+    QueryPerformanceCounter(&s_texLkT0);
+}
+extern "C" void xbox_texLkProbeEnd()
+{
+    static LARGE_INTEGER s_qf = { 0 };
+    if (s_qf.QuadPart == 0)
+        QueryPerformanceFrequency(&s_qf);
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    g_stat_texLkUs += (unsigned)((t1.QuadPart - s_texLkT0.QuadPart) * 1000000 / s_qf.QuadPart);
+}
+
+extern "C" unsigned g_stat_volHashBytes = 0;    // bytes hashed by volatile hash-skip (TexCache.cpp)
+
+// Idle-loop skip (consumed by rec_x86.cpp block prologues; 0 = off). Set per
+// game ID after loadGame. Found via the HOTBLOCKS JIT audit: MvC2 spends ~55%
+// of guest time spinning in its wait-for-vblank loop; draining the timeslice
+// on the poll block fast-forwards guest time through the scheduler instead of
+// emulating no-ops. Semantically transparent (loop exits at the same guest
+// time the vblank ISR sets the flag).
+extern "C" u32 g_idleSkipPc = 0;
+extern "C" u16 g_idleSkipOp = 0;    // first SH4 word of the verified poll loop (guard)
+
+// Auto-detected idle loops (filled by bm_AutoIdleScan in blockmanager.cpp;
+// consumed by rec_x86.cpp). Works for every game -- no per-game table needed.
+// 32 entries: BIOS boot + menus alone armed 8 in Crazy Taxi and filled the
+// original table before gameplay started. g_autoIdleOp records the poll
+// loop's first instruction so overlay-replaced code at an armed pc is never
+// wrongly drained.
+extern "C" u32 g_autoIdlePc[32] = {};
+extern "C" u16 g_autoIdleOp[32] = {};
+extern "C" u32 g_autoIdleCount = 0;
+
 extern "C" volatile unsigned  g_arm_fallbacks = 0;   // ARM7 JIT -> interpreter fallbacks
+
+// ARM7 JIT execution-shape counters (emitted incs, gated by kArmJitCounters in
+// arm7_rec_x86.cpp): blocks entered, flag-saving ops, conditional ops.
+extern "C" unsigned g_cnt_armBlk  = 0;
+extern "C" unsigned g_cnt_armSop  = 0;
+extern "C" unsigned g_cnt_armCond = 0;
 
 // MMU diagnostics (mmu.cpp): direct measurement of mmu_data_translation, since
 // the TLB last-hit cache showed no measurable change and indirect (game vs
@@ -209,6 +312,7 @@ extern "C" volatile unsigned g_stat_idx;
 extern "C" volatile unsigned g_stat_polys;
 extern "C" unsigned g_stat_vbLockUs;   // GPU-sync stall time in VB/IB Lock
 extern "C" unsigned g_stat_volatileTex;	// uploads that skipped re-protection (TexCache.cpp)
+extern "C" unsigned g_stat_volSkip;		// volatile updates skipped via content hash (TexCache.cpp)
 
 static unsigned g_sehCode = 0, g_sehAddr = 0;
 static int sehFilter(struct _EXCEPTION_POINTERS* ep)
@@ -295,11 +399,23 @@ namespace addrspace { extern u8* ram_base; }   // fastmem base (read guest RAM)
 // Xbox debug-monitor thread API (xbdm.lib) -- lets the watchdog read the FROZEN
 // emu thread's HOST x86 EIP, to see where the dynarec is actually stuck (a JIT
 // block vs the block compiler vs a C++ helper).
+// USE_XBDM MUST stay 0 for shippable builds: an XBE that imports xbdm cannot be
+// loaded by a retail kernel -- it bounces straight back to the dashboard before
+// any of our code runs. Enable only for devkit/debug-BIOS diagnostic sessions.
+#define USE_XBDM 0
+#if USE_XBDM
 extern "C" {
     long __stdcall DmSuspendThread(unsigned long dwThreadId);
     long __stdcall DmResumeThread(unsigned long dwThreadId);
     long __stdcall DmGetThreadContext(unsigned long dwThreadId, CONTEXT* pCtx);
 }
+#else
+// Retail-safe stubs: same signatures, no xbdm import. GetThreadContext reports
+// failure (Eip stays 0), which every caller already treats as "no sample".
+static long DmSuspendThread(unsigned long) { return 0; }
+static long DmResumeThread(unsigned long) { return 0; }
+static long DmGetThreadContext(unsigned long, CONTEXT*) { return -1; }
+#endif
 static unsigned long g_emuTid = 0;   // emu (main) thread id, set before the loop
 extern "C" volatile unsigned g_uintc_calls;   // scheduler-tick counter (sh4_interpreter.cpp)
 
@@ -515,12 +631,24 @@ static bool runEmu()
         // input, then let the user navigate the drives and pick a disc image --
         // or choose "Boot Dreamcast BIOS" which returns "" (boots the DC menu).
         xbox_InitInput();
+        // (An autoboot experiment briefly lived here 2026-07-03 and was
+        // rejected by the user -- the file browser IS the boot flow. Do not
+        // bypass it again.)
         DBG("FLYCAST: running file browser...\n");
         const char* gamePath = xbox_RunFileBrowser();   // blocks until selection
         DBG("FLYCAST: emu.loadGame(\"");
         DBG(gamePath[0] ? gamePath : "<DREAMCAST BIOS>");
         DBG("\")\n");
         emu.loadGame(gamePath);
+        // Idle-loop skip table (g_idleSkipPc, consumed by the SH4 JIT block
+        // prologue). Per-game entries found with the HOTBLOCKS audit; the
+        // address is the game's wait-for-vblank POLL block.
+        if (settings.content.gameId == "T1212N")        // Marvel vs Capcom 2
+        {
+            g_idleSkipPc = 0x8c19162e;
+            g_idleSkipOp = 0x61f2;      // mov.l @r15,r1 -- verified poll loop head
+            DBG("FLYCAST: idle-skip armed @8c19162e (MvC2 vblank-wait loop)\n");
+        }
         // loadGame() runs config::Settings::reset(), which re-defaults
         // ThreadedRendering back to TRUE -- undoing the override we set before
         // loadGame. Re-assert it FALSE here so emu.start() takes the
@@ -539,6 +667,19 @@ static bool runEmu()
         config::DynarecEnabled.override(xbox_UseDynarec());
         DBG((bool)config::DynarecEnabled ? "FLYCAST: Dynarec=TRUE (JIT)\n"
                                          : "FLYCAST: Dynarec=FALSE (INTERPRETER)\n");
+
+        // Emulated SH4 clock in MHz (200 = stock). The 150MHz experiment was
+        // REJECTED: hardware showed only +3-5 speed points in mid scenes and
+        // ~+1 in the worst ones (2026-07-03 CT log) -- nowhere near the
+        // theoretical 25% -- and it degrades game fidelity. Keep at 200.
+        static const int kSh4ClockMHz = 200;
+        config::Sh4Clock.override(kSh4ClockMHz);
+        {
+            char ckbuf[64];
+            wsprintfA(ckbuf, "FLYCAST: Sh4Clock=%dMHz (200=stock)\n", kSh4ClockMHz);
+            DBG(ckbuf);
+        }
+
         DBG("FLYCAST: emu.start()\n");
         emu.start();
         DBG("FLYCAST: emu.start() RETURNED; entering render loop\n");
@@ -576,6 +717,7 @@ static bool runEmu()
         }
         long long armBase = g_prof_arm_cyc, aicaBase = g_prof_aica_cyc, texBase = g_prof_tex_cyc;
         long long taBase = g_prof_ta_cyc;  unsigned taCntBase = g_cnt_ta;
+        unsigned armBlkBase = g_cnt_armBlk, armSopBase = g_cnt_armSop, armCondBase = g_cnt_armCond;
         unsigned armFbBase = g_arm_fallbacks;
         unsigned drawBase = g_stat_drawCalls, stateCallBase = g_stat_stateCalls;
         unsigned stateSkipBase = g_stat_stateSkipped, polyBase = g_stat_polys;
@@ -727,7 +869,24 @@ static bool runEmu()
                 // includes the rdtsc probe's own overhead -- treat as upper bound).
                 long long taUsPf = (g_prof_ta_cyc - taBase) / cycPerUs / 60;  taBase = g_prof_ta_cyc;
                 unsigned taCntPf = (g_cnt_ta - taCntBase) / 60;  taCntBase = g_cnt_ta;
-                wsprintfA(buf, "  TA: us/f=%d chunks/f=%u\n", (int)taUsPf, taCntPf);
+                unsigned parsePf = g_stat_parseUs / 60;  g_stat_parseUs = 0;
+                unsigned sortPf = g_stat_sortUs / 60;  g_stat_sortUs = 0;
+                // dec = TaCmd decode loop (contains texlk); texlk = GetTexture
+                // (lookup + volatile hash + convert + upload); hashKB = volatile
+                // hash-skip bytes hashed per WINDOW. dec-texlk = pure decode.
+                unsigned decPf = g_stat_decodeUs / 60;  g_stat_decodeUs = 0;
+                unsigned texLkPf = g_stat_texLkUs / 60;  g_stat_texLkUs = 0;
+                unsigned hashKb = g_stat_volHashBytes / 1024;  g_stat_volHashBytes = 0;
+                wsprintfA(buf, "  TA: us/f=%d chunks/f=%u parse/f=%uus sort/f=%uus dec/f=%uus texlk/f=%uus hashKB/w=%u\n",
+                          (int)taUsPf, taCntPf, parsePf, sortPf, decPf, texLkPf, hashKb);
+                OutputDebugStringA(buf);
+
+                // ARM7 JIT execution shape: blocks, flag-setting ops, conditional
+                // ops per frame (emitted counters; ~0 if kArmJitCounters off).
+                unsigned armBlkPf = (g_cnt_armBlk - armBlkBase) / 60;  armBlkBase = g_cnt_armBlk;
+                unsigned armSopPf = (g_cnt_armSop - armSopBase) / 60;  armSopBase = g_cnt_armSop;
+                unsigned armCondPf = (g_cnt_armCond - armCondBase) / 60;  armCondBase = g_cnt_armCond;
+                wsprintfA(buf, "  ARMJIT: blk/f=%u sop/f=%u cond/f=%u\n", armBlkPf, armSopPf, armCondPf);
                 OutputDebugStringA(buf);
 
                 // Direct MMU data-translation measurement (mmu.cpp): mmuUs is
@@ -845,9 +1004,24 @@ static bool runEmu()
                 unsigned polyPf = (g_stat_polys - polyBase) / 60;  polyBase = g_stat_polys;
                 unsigned vbLockPf = g_stat_vbLockUs / 60;  g_stat_vbLockUs = 0;
                 unsigned volTexW = g_stat_volatileTex;  g_stat_volatileTex = 0;
-                wsprintfA(buf, "  RENDER: draws/f=%u polys/f=%u stateSet/f=%u stateSkip/f=%u verts=%u idx=%u vbLock/f=%uus volTex/w=%u\n",
-                          drawPf, polyPf, setPf, skipPf, g_stat_verts, g_stat_idx, vbLockPf, volTexW);
+                unsigned volSkipW = g_stat_volSkip;  g_stat_volSkip = 0;
+                wsprintfA(buf, "  RENDER: draws/f=%u polys/f=%u stateSet/f=%u stateSkip/f=%u verts=%u idx=%u vbLock/f=%uus volTex/w=%u volSkip/w=%u\n",
+                          drawPf, polyPf, setPf, skipPf, g_stat_verts, g_stat_idx, vbLockPf, volTexW, volSkipW);
                 OutputDebugStringA(buf);
+
+                // Auto idle-loop detection: once per window (~1s) arm any
+                // candidate block spinning at wait-loop rates (logs each
+                // arming as "auto idle-skip armed @pc"). Only while the game
+                // is actively rendering (taCntPf = TA chunks/frame this
+                // window); when rendering stops (loading screens), everything
+                // auto-armed is disarmed -- loader pump loops look exactly
+                // like wait loops but their iteration count drives progress
+                // (Crazy Taxi CD loads). To re-run the full JIT audit, flip
+                // kBlockProfile in rec_x86.cpp and call bm_DumpHotBlocks(10).
+                {
+                    extern void bm_AutoIdleScan(bool gameRendering);
+                    bm_AutoIdleScan(taCntPf > 0);
+                }
                 emuUsAcc = 0;
             }
         }

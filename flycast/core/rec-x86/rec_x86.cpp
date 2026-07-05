@@ -45,6 +45,47 @@ static Xbyak::Operand::Code alloc_regs[] {  Xbyak::Operand::EBX,  Xbyak::Operand
 // an `inc` emitted in every block prologue. kJitCounters gates EMISSION (a C++
 // compile-time constant folded at codegen time): false = zero runtime cost.
 static const bool kJitCounters = false;
+
+// Folded per-block cycle check (sub sets the flags; no separate load+test).
+// See the prologue in X86Compiler::compile. Flip to false to restore the
+// original 4-instruction check if any timing/interrupt misbehaviour appears.
+static const bool kSh4FastCycleCheck = true;
+
+// JIT audit builds: emit a per-BLOCK execution counter (inc of profRuns in the
+// RuntimeBlockInfo) so bm_DumpHotBlocks can print the hottest blocks' emitted
+// x86 for offline inspection. Costs one memory inc per block entry -- flip to
+// false for release builds.
+static const bool kBlockProfile = false;
+
+// Idle-loop skip (set from main_xbox.cpp per game id, 0 = off). The HOTBLOCKS
+// audit (2026-07-05, MvC2 fight) showed ~55% of ALL guest time spinning in the
+// game's wait-for-vblank loop (poll block + tiny task dispatcher + empty
+// callback, ~2.2M iterations/s) -- host CPU burned emulating no-ops. When a
+// block's vaddr matches, its prologue zeroes cycle_counter so every entry
+// drains the timeslice through intc_sched: guest time advances a full
+// timeslice per poll instead of ~50 cycles, cutting spin iterations ~9x.
+// Semantically transparent: the loop still exits at the exact guest time the
+// vblank ISR sets the flag; only the poll granularity coarsens (~2us guest).
+// Validated on hardware: MvC2 fights 74-84% -> 90-100%.
+// g_idleSkipOp = first SH4 word of the verified poll loop; the drain is only
+// emitted while that instruction is actually present at the address.
+extern "C" u32 g_idleSkipPc;
+extern "C" u16 g_idleSkipOp;
+
+// Automatic version of the above, for EVERY game (no per-game table needed).
+// Compile-time fingerprint marks candidates: tiny (<=6 guest ops), memory
+// READ-ONLY (no writem/ifb/pref/sync -- work loops write their results, wait
+// loops don't), branching backward onto/near themselves. Candidates carry a
+// run counter; bm_AutoIdleScan (called ~1/s by the platform loop) arms any
+// candidate spinning above wait-loop rates and recompiles it with the drain.
+// A false positive would only make that loop's guest time pass faster (no
+// corruption -- read-only), and every arming is logged for blacklisting.
+// DISABLED 2026-07-05: hardware testing showed the fingerprint (tiny,
+// read-only, fast) also matches loops whose ITERATION COUNT does bounded work
+// (CD-loader pumps, boot decompressors, possibly mid-frame handshakes) --
+// symptoms: slow boots, game-internal sluggishness while speed reads ~100%.
+// Needs a verify-by-trial redesign before re-enabling.
+static const bool kAutoIdleDetect = false;
 extern "C" unsigned g_cnt_block;
 // Code-region markers (defined in main_xbox.cpp, assigned by driver.cpp /
 // genMemHandlers): used by rewrite() to tell an INLINE fastmem fault (pc inside
@@ -144,14 +185,72 @@ void X86Compiler::compile(RuntimeBlockInfo* block, bool force_checks, bool optim
 	// Diagnostic builds only -- ~350k emitted incs/frame cost ~1ms at 733MHz.
 	if (kJitCounters)
 		inc(dword[&g_cnt_block]);
-	mov(eax, dword[&sh4ctx.cycle_counter]);
-	test(eax, eax);
+
+	// Automatic idle-loop detection (see kAutoIdleDetect above): flag blocks
+	// with the wait-loop fingerprint and count their executions.
+	if (kAutoIdleDetect
+			&& block->guest_opcodes <= 6
+			&& block->BranchBlock != 0xFFFFFFFF
+			&& block->BranchBlock <= block->vaddr
+			&& block->vaddr - block->BranchBlock <= 64)
+	{
+		bool readOnly = true;
+		for (const shil_opcode& op : block->oplist)
+			if (op.op == shop_writem || op.op == shop_ifb || op.op == shop_pref
+					|| op.op == shop_sync_sr || op.op == shop_sync_fpscr)
+			{
+				readOnly = false;
+				break;
+			}
+		block->idleCandidate = readOnly;
+	}
+	if (kBlockProfile || block->idleCandidate)
+		inc(dword[&block->profRuns]);	// audit dump and/or auto idle detection
+
+	if (g_idleSkipPc != 0 && block->vaddr == g_idleSkipPc)
+	{
+		// Idle-loop skip (see g_idleSkipPc above): force the timeslice drained
+		// so this entry goes through intc_sched and guest time fast-forwards.
+		// Fingerprint-guarded: only while the VALIDATED poll instruction is
+		// loaded at that address -- during boot the same RAM holds loader
+		// code, and draining an iteration-bound work loop slows it massively.
+		const u16 *op = (const u16 *)GetMemPtr(block->addr, 2);
+		if (op != nullptr && *op == g_idleSkipOp)
+			mov(dword[&sh4ctx.cycle_counter], 0);
+	}
+	else if (bm_IsAutoIdleBlock(block))
+		mov(dword[&sh4ctx.cycle_counter], 0);	// auto entries (kAutoIdleDetect builds)
 	Xbyak::Label no_up;
-	jg(no_up);
-	mov(ecx, block->vaddr);
-	call((const void *)intc_sched);
-	L(no_up);
-	sub(dword[&sh4ctx.cycle_counter], block->guest_cycles);
+	if (kSh4FastCycleCheck)
+	{
+		// Folded cycle check: let the sub itself produce the flags instead of
+		// a separate load+test (2 instructions + 1 L1 access on EVERY block
+		// entry, ~350k/frame in MvC2). Semantics preserved: the check still
+		// runs before the block body; the slow path undoes the decrement so
+		// intc_sched sees the exact same counter value as the old code, and
+		// redoes it only on the continue path (do_iter redirects skip it,
+		// exactly like the old order where the sub came after the call). The
+		// only difference is the timeslice boundary can trigger up to one
+		// block's guest_cycles early -- bounded jitter well below the natural
+		// block-length variance.
+		sub(dword[&sh4ctx.cycle_counter], block->guest_cycles);
+		jg(no_up);
+		add(dword[&sh4ctx.cycle_counter], block->guest_cycles);
+		mov(ecx, block->vaddr);
+		call((const void *)intc_sched);
+		sub(dword[&sh4ctx.cycle_counter], block->guest_cycles);
+		L(no_up);
+	}
+	else
+	{
+		mov(eax, dword[&sh4ctx.cycle_counter]);
+		test(eax, eax);
+		jg(no_up);
+		mov(ecx, block->vaddr);
+		call((const void *)intc_sched);
+		L(no_up);
+		sub(dword[&sh4ctx.cycle_counter], block->guest_cycles);
+	}
 
 	regalloc.doAlloc(block);
 

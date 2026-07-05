@@ -12,6 +12,9 @@
 
 #include <algorithm>
 #include <utility>
+#if HOST_CPU == CPU_X86
+#include <xmmintrin.h>	// _mm_prefetch in the ta_parse decode loop
+#endif
 
 #define TACALL DYNACALL
 #ifdef NDEBUG
@@ -323,6 +326,13 @@ case num : {\
 
 		do
 		{
+#if HOST_CPU == CPU_X86
+			// This inner loop consumes the bulk of the TA stream WITHOUT
+			// returning to ta_parse_vdrc, so the outer loop's prefetch never
+			// covers it -- prefetch here, two cache lines ahead of the
+			// read-once stream (NTA keeps it out of L2).
+			_mm_prefetch((const char *)data + 128, _MM_HINT_NTA);
+#endif
 			verify(data->pcw.ParaType == ParamType_Vertex_Parameter);
 			ta_handle_poly<poly_type,0>(data, 0);
 			if (data->pcw.EndOfStrip)
@@ -388,6 +398,11 @@ strip_end:
 	{
 		while (data < data_end)
 		{
+#if HOST_CPU == CPU_X86
+			// Same reasoning as the ta_poly_data loop: this loop walks the TA
+			// stream internally, out of reach of the outer loop's prefetch.
+			_mm_prefetch((const char *)data + 128, _MM_HINT_NTA);
+#endif
 			if (settings.platform.isNaomi2() && (data->pcw.full & 0x08000000) != 0)
 			{
 				DEBUG_LOG(PVR, "Naomi 2 command detected");
@@ -664,7 +679,21 @@ private:
 	static Vertex* vert_cvt_base_(T* vtx)
 	{
 		f32 invW = vtx->xyz[2];
-		vd_rc.verts.emplace_back();
+		// emplace_back() value-initializes: MSVC zeroes all 56 Vertex bytes
+		// before the converter overwrites the real fields -- pure waste in the
+		// hottest per-vertex path (decode measured 1.3-1.6ms/frame in MvC2
+		// fights). Grow through a layout-identical wrapper whose default ctor
+		// is a no-op instead. Safe because every field a consumer reads is
+		// written for the poly types that expose it: x/y/z/col always; spc only
+		// exists for pcw.Offset formats (and the renderer gates SPECULARENABLE
+		// on pcw.Offset); u/v only for textured formats (texturing off
+		// otherwise); col1/spc1/u1/v1/nx.. are two-volume/Naomi2-only, which
+		// this renderer never reads. The sprite path (resize +4) and the
+		// 4 background verts (Clear's resize) keep their zero-init.
+		struct VertexNoInit { Vertex v; VertexNoInit() {} };
+		static_assert(sizeof(VertexNoInit) == sizeof(Vertex), "layout must match");
+		auto& rawVerts = reinterpret_cast<std::vector<VertexNoInit>&>(vd_rc.verts);
+		rawVerts.emplace_back();
 		Vertex* cv = &vd_rc.verts.back();
 		cv->x = vtx->xyz[0];
 		cv->y = vtx->xyz[1];
@@ -1166,8 +1195,23 @@ private:
 static void getRegionTileClipping(u32& xmin, u32& xmax, u32& ymin, u32& ymax);
 static void getRegionSettings(int passNumber, RenderPass& pass);
 
+// Component profiler (Xbox port): splits Renderer::Process ("parse/f") into
+// its two halves -- this function (index building + translucency sort) vs the
+// TaCmd vertex decode that precedes it. QPC-based, one pair per render pass.
+extern "C" void xbox_sortProbeBegin();
+extern "C" void xbox_sortProbeEnd();
+// Decode-loop probe (see main_xbox.cpp): parse minus sort leaves ~1.3-1.9ms in
+// fights; this isolates the TaCmd while-loop from the pass-setup remainder.
+extern "C" void xbox_decodeProbeBegin();
+extern "C" void xbox_decodeProbeEnd();
+
 static void parseRenderPass(RenderPass& pass, const RenderPass& previousPass, rend_context& ctx, bool primRestart)
 {
+	struct ProbeScope {
+		ProbeScope() { xbox_sortProbeBegin(); }
+		~ProbeScope() { xbox_sortProbeEnd(); }
+	} probeScope;
+
 	const bool perPixel = config::RendererType == RenderType::OpenGL_OIT
 			|| config::RendererType == RenderType::DirectX11_OIT
 			|| config::RendererType == RenderType::Vulkan_OIT;
@@ -1238,12 +1282,22 @@ static void ta_parse_vdrc(TA_context* ctx, bool primRestart)
 		Ta_Dma* ta_data = (Ta_Dma *)childCtx->getTADataBegin();
 		Ta_Dma* ta_data_end = (Ta_Dma *)childCtx->getTADataEnd();
 
+		xbox_decodeProbeBegin();
 		while (ta_data < ta_data_end)
 			try {
+#if HOST_CPU == CPU_X86
+				// The TA buffer is megabytes of write-once data, always cold
+				// by parse time -- decode stalls on a cache miss every other
+				// 32-byte chunk (~0.3-0.4us/vertex measured). Prefetch two
+				// lines ahead; NTA keeps the read-once stream out of L2.
+				_mm_prefetch((const char *)ta_data + 64, _MM_HINT_NTA);
+				_mm_prefetch((const char *)ta_data + 128, _MM_HINT_NTA);
+#endif
 				ta_data = BaseTAParser::TaCmd(ta_data, ta_data_end);
 			} catch (const TAParserException& e) {
 				break;
 			}
+		xbox_decodeProbeEnd();
 
 		// Disable blending for opaque polys of the first pass
 		if (pass == 0)

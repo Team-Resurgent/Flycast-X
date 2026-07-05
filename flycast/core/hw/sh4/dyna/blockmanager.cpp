@@ -43,6 +43,181 @@ u32 unprotected_blocks;
 
 #define FPCA(x) ((DynarecCodeEntryPtr&)p_sh4rcb->fpcb[(x>>1)&FPCB_MASK])
 
+// ---- Xbox port JIT audit -----------------------------------------------
+// Dumps the hottest blocks of the last interval (profRuns is bumped by an inc
+// emitted in each block prologue when kBlockProfile is on in rec_x86.cpp):
+// header line + SH4 opcode words + the emitted x86 bytes in hex, so the
+// generated code quality can be inspected offline. Counts reset after each
+// dump so every dump covers exactly one interval.
+extern "C" void __stdcall OutputDebugStringA(const char *);
+
+void bm_DumpHotBlocks(int topN)
+{
+	std::vector<std::pair<u64, RuntimeBlockInfo*>> hot;
+	u64 total = 0;
+	for (auto& [codePtr, blk] : blkmap)
+	{
+		if (blk->profRuns == 0)
+			continue;
+		u64 score = (u64)blk->profRuns * std::max(blk->guest_cycles, 1u);
+		total += score;
+		hot.emplace_back(score, blk.get());
+	}
+	if (total == 0)
+		return;
+
+	if ((int)hot.size() > topN)
+	{
+		std::partial_sort(hot.begin(), hot.begin() + topN, hot.end(),
+				[](const auto& a, const auto& b) { return a.first > b.first; });
+		hot.resize(topN);
+	}
+	else
+		std::sort(hot.begin(), hot.end(),
+				[](const auto& a, const auto& b) { return a.first > b.first; });
+
+	char line[256];
+	snprintf(line, sizeof(line), "HOTBLOCKS: %u blocks ran, total score %llu (runs x guest_cycles)\n",
+			(u32)blkmap.size(), (unsigned long long)total);
+	OutputDebugStringA(line);
+
+	for (auto& [score, blk] : hot)
+	{
+		snprintf(line, sizeof(line),
+				" BLK %08x runs=%u cyc=%u ops=%u sh4B=%u x86B=%u share=%d%% type=%d\n",
+				blk->vaddr, blk->profRuns, blk->guest_cycles, blk->guest_opcodes,
+				blk->sh4_code_size, blk->host_code_size,
+				(int)(score * 100 / total), (int)blk->BlockType);
+		OutputDebugStringA(line);
+
+		// SH4 opcode words
+		const u16 *sh4 = (const u16 *)GetMemPtr(blk->addr, blk->sh4_code_size);
+		if (sh4 != nullptr)
+		{
+			int n = blk->sh4_code_size / 2;
+			int pos = snprintf(line, sizeof(line), "  SH4:");
+			for (int i = 0; i < n && pos < (int)sizeof(line) - 6; i++)
+				pos += snprintf(line + pos, sizeof(line) - pos, " %04x", sh4[i]);
+			snprintf(line + pos, sizeof(line) - pos, "\n");
+			OutputDebugStringA(line);
+		}
+
+		// Emitted x86, 32 bytes per line, capped
+		const u8 *x86 = (const u8 *)blk->code;
+		u32 len = std::min(blk->host_code_size, 512u);
+		for (u32 off = 0; off < len; off += 32)
+		{
+			int pos = snprintf(line, sizeof(line), "  X86+%03x:", off);
+			for (u32 i = off; i < std::min(off + 32, len); i++)
+				pos += snprintf(line + pos, sizeof(line) - pos, "%02x", x86[i]);
+			snprintf(line + pos, sizeof(line) - pos, "\n");
+			OutputDebugStringA(line);
+		}
+	}
+
+	// Reset so the next dump covers only the next interval
+	for (auto& [codePtr, blk] : blkmap)
+		blk->profRuns = 0;
+}
+
+// Automatic idle-loop skip. Candidate blocks (compile-time fingerprint: tiny,
+// read-only, tight backward loop -- see rec_x86.cpp) carry a run counter; any
+// candidate sustaining >600k iterations between scans (~1s) can only be a
+// wait-for-event poll (MvC2's measured 2.2M/s; real work loops write memory
+// and never qualify). Arming = record the vaddr and discard the block so it
+// recompiles with the timeslice drain; bm_DiscardBlock also relinks all
+// predecessors, so wired links can't keep jumping into the un-drained code.
+extern "C" u32 g_autoIdlePc[32];
+extern "C" u16 g_autoIdleOp[32];
+extern "C" u32 g_autoIdleCount;
+
+bool bm_IsAutoIdleBlock(RuntimeBlockInfo* block)
+{
+	for (u32 i = 0; i < g_autoIdleCount; i++)
+		if (g_autoIdlePc[i] == block->vaddr)
+		{
+			// Code-replacement guard: overlays can load DIFFERENT code at an
+			// armed address later; draining a real work loop there would
+			// inflate its guest time. Only drain while the recorded first
+			// instruction of the poll loop is still present.
+			const u16 *op = (const u16 *)GetMemPtr(block->addr, 2);
+			return op != nullptr && *op == g_autoIdleOp[i];
+		}
+	return false;
+}
+
+void bm_AutoIdleScan(bool gameRendering)
+{
+	constexpr u32 kIdleRunsPerScan = 600000;
+
+	// Not rendering (loading screens, disc access, transitions): a spinning
+	// read-only loop here can be a pump loop whose ITERATION COUNT drives
+	// progress (Crazy Taxi's CD loader: draining it slowed loading ~1000x and
+	// looked like a hang). Never arm in this state, and DISARM everything so
+	// any armed loop that is also used by a loader self-heals within a scan.
+	if (!gameRendering)
+	{
+		for (auto& [codePtr, blk] : blkmap)
+			blk->profRuns = 0;
+		if (g_autoIdleCount != 0)
+		{
+			std::vector<RuntimeBlockInfo*> armed;
+			for (auto& [codePtr, blk] : blkmap)
+				for (u32 i = 0; i < g_autoIdleCount; i++)
+					if (blk->vaddr == g_autoIdlePc[i])
+					{
+						armed.push_back(blk.get());
+						break;
+					}
+			g_autoIdleCount = 0;
+			for (RuntimeBlockInfo* blk : armed)
+				bm_DiscardBlock(blk);	// recompiles WITHOUT the drain
+			OutputDebugStringA("FLYCAST: auto idle-skip DISARMED (game not rendering)\n");
+		}
+		return;
+	}
+
+	std::vector<std::pair<RuntimeBlockInfo*, u32>> hot;
+	for (auto& [codePtr, blk] : blkmap)
+	{
+		u32 runs = blk->profRuns;
+		if (runs == 0)
+			continue;
+		blk->profRuns = 0;
+		if (!blk->idleCandidate)	// audit builds count every block; ignore those
+			continue;
+		if (runs >= kIdleRunsPerScan)
+			hot.push_back({ blk.get(), runs });
+	}
+
+	// Arm outside the iteration: bm_DiscardBlock erases from blkmap.
+	for (auto& [blk, runs] : hot)
+	{
+		bool known = false;
+		for (u32 i = 0; i < g_autoIdleCount && !known; i++)
+			known = g_autoIdlePc[i] == blk->vaddr;
+		if (known)
+			continue;
+		if (g_autoIdleCount >= std::size(g_autoIdlePc))
+		{
+			OutputDebugStringA("FLYCAST: auto idle-skip table FULL\n");
+			break;
+		}
+		const u16 *op = (const u16 *)GetMemPtr(blk->addr, 2);
+		if (op == nullptr)
+			continue;
+		g_autoIdlePc[g_autoIdleCount] = blk->vaddr;
+		g_autoIdleOp[g_autoIdleCount] = *op;
+		g_autoIdleCount++;
+		char line[96];
+		snprintf(line, sizeof(line), "FLYCAST: auto idle-skip armed @%08x (%u polls/scan)\n",
+				blk->vaddr, runs);
+		OutputDebugStringA(line);
+		bm_DiscardBlock(blk);
+	}
+}
+// --------------------------------------------------------------------------
+
 // addr must be a physical address
 // This returns an executable address
 static DynarecCodeEntryPtr DYNACALL bm_GetCode(u32 addr)
